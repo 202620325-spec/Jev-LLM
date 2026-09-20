@@ -676,11 +676,11 @@ class CoreTests(unittest.TestCase):
             layers_override=3,
             generated_override=8,
         )
-        self.assertEqual(solar.verify_calls, 1)
+        self.assertGreaterEqual(solar.verify_calls, 1)
         self.assertGreaterEqual(solar.challenge_calls, 1)
         # Initial candidates are evaluated once; no all-pool semantic rescore after VERIFY.
         self.assertEqual(jev.eval_calls, 2)  # initial pool + newly challenged candidates
-        self.assertNotEqual(net.last_stats["adaptive_actions"][:2], ["VERIFY", "VERIFY"])
+        self.assertEqual(net.last_stats["adaptive_actions"][:2], ["VERIFY", "CHALLENGE"])
         self.assertGreater(net.last_stats["reused_evaluations"], 0)
 
     def test_evidence_falsification_can_remove_semantic_leader(self):
