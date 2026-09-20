@@ -6,6 +6,7 @@ from typing import Any
 
 import requests
 
+from .audit import make_call_record
 from .config import Config
 from .types import RESPONSE_LENGTHS, SolarResult, Usage
 from .util import extract_json, recover_candidate_strings
@@ -19,6 +20,7 @@ class SolarClient:
     def __init__(self, config: Config):
         self.config = config
         self.call_count = 0
+        self.audit_calls: list[dict[str, Any]] = []
         self.last_render_stats: dict[str, Any] = {}
         self.session = requests.Session()
         self.session.headers.update(
@@ -46,13 +48,34 @@ class SolarClient:
             payload["max_tokens"] = max_tokens
 
         self.call_count += 1
+        request_log = {
+            "messages": messages,
+            "reasoning_effort": reasoning_effort,
+            "max_tokens": max_tokens,
+        }
         try:
             response = self.session.post(self.config.solar_url, json=payload, timeout=self.config.request_timeout)
         except requests.RequestException as exc:
+            self.audit_calls.append(make_call_record(
+                provider="solar",
+                model=self.config.solar_model,
+                request=request_log,
+                response=None,
+                usage={"reported": False, "input_tokens": 0, "output_tokens": 0},
+                error={"type": type(exc).__name__, "message": str(exc)},
+            ))
             raise SolarError(f"Solar request failed: {exc}") from exc
 
         if not response.ok:
             body = response.text[:2000]
+            self.audit_calls.append(make_call_record(
+                provider="solar",
+                model=self.config.solar_model,
+                request=request_log,
+                response={"http_status": response.status_code, "body": body},
+                usage={"reported": False, "input_tokens": 0, "output_tokens": 0},
+                error={"type": "HTTPError", "message": f"HTTP {response.status_code}"},
+            ))
             raise SolarError(f"Solar HTTP {response.status_code}: {body}")
 
         data = response.json()
@@ -60,6 +83,14 @@ class SolarClient:
             message = data["choices"][0]["message"]
             text = message.get("content") or ""
         except (KeyError, IndexError, TypeError) as exc:
+            self.audit_calls.append(make_call_record(
+                provider="solar",
+                model=self.config.solar_model,
+                request=request_log,
+                response={"raw": data},
+                usage={"reported": False, "input_tokens": 0, "output_tokens": 0},
+                error={"type": type(exc).__name__, "message": "Unexpected Solar response shape"},
+            ))
             raise SolarError(f"Unexpected Solar response: {data}") from exc
 
         usage_raw = data.get("usage") or {}
@@ -67,7 +98,26 @@ class SolarClient:
             input_tokens=int(usage_raw.get("prompt_tokens", usage_raw.get("input_tokens", 0)) or 0),
             output_tokens=int(usage_raw.get("completion_tokens", usage_raw.get("output_tokens", 0)) or 0),
         )
-        return SolarResult(text=text, reasoning=message.get("reasoning"), usage=usage, raw=data)
+        usage_reported = isinstance(data.get("usage"), dict) and bool(data.get("usage"))
+        result = SolarResult(text=text, reasoning=message.get("reasoning"), usage=usage, raw=data)
+        self.audit_calls.append(make_call_record(
+            provider="solar",
+            model=self.config.solar_model,
+            request=request_log,
+            response={
+                "content": text,
+                "reasoning": message.get("reasoning"),
+                "finish_reason": (data.get("choices") or [{}])[0].get("finish_reason"),
+                "raw": data,
+            },
+            usage={
+                "reported": usage_reported,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "raw": usage_raw,
+            },
+        ))
+        return result
 
     def plan(self, user_text: str, history: list[dict[str, str]]) -> dict[str, Any]:
         recent = history[-8:]
