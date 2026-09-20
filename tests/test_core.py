@@ -1,5 +1,9 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from jevllm.audit import ConversationJSONLogger, summarize_usage
 from jevllm.config import Config
 from jevllm.controller import AdaptiveController
 from jevllm.engine import JevLLM
@@ -10,6 +14,86 @@ from jevllm.util import extract_json, recover_candidate_strings, score_expectati
 
 
 class CoreTests(unittest.TestCase):
+    def test_usage_summary_counts_only_provider_reported_tokens(self):
+        calls = [
+            {
+                "provider": "solar",
+                "usage": {"reported": True, "input_tokens": 120, "output_tokens": 30},
+            },
+            {
+                "provider": "jev",
+                "usage": {"reported": False, "input_tokens": 0, "output_tokens": 0},
+            },
+            {
+                "provider": "solar",
+                "usage": {"reported": True, "input_tokens": 80, "output_tokens": 20},
+            },
+        ]
+        usage = summarize_usage(calls)
+        self.assertEqual(usage["input_tokens"], 200)
+        self.assertEqual(usage["output_tokens"], 50)
+        self.assertEqual(usage["total_tokens"], 250)
+        self.assertEqual(usage["reported_calls"], 2)
+        self.assertEqual(usage["unreported_calls"], 1)
+        self.assertFalse(usage["all_calls_reported"])
+        self.assertEqual(usage["by_provider"]["solar"]["total_tokens"], 250)
+        self.assertEqual(usage["by_provider"]["jev"]["unreported_calls"], 1)
+
+    def test_conversation_json_logger_preserves_reasoning_and_events_verbatim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = ConversationJSONLogger(tmp)
+            reasoning = "line 1\nline 2\n{"raw": true}"
+            calls = [
+                {
+                    "ts_ns": 2,
+                    "timestamp": "2026-01-01T00:00:02+00:00",
+                    "provider": "solar",
+                    "model": "solar-pro3",
+                    "request": {"messages": [{"role": "user", "content": "q"}]},
+                    "response": {
+                        "content": "answer",
+                        "reasoning": reasoning,
+                        "raw": {"choices": [{"message": {"reasoning": reasoning}}},
+                    },
+                    "usage": {
+                        "reported": True,
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "raw": {"prompt_tokens": 11, "completion_tokens": 7},
+                    },
+                    "error": None,
+                },
+                {
+                    "ts_ns": 1,
+                    "timestamp": "2026-01-01T00:00:01+00:00",
+                    "provider": "jev",
+                    "model": "typesafe/jev-1.13",
+                    "request": {"state": {"x": 1}, "questions": {"next": {"type": "choice"}}},
+                    "response": {"reasoning": None, "raw": {"answers": {"next": {"choice": "STOP"}}}},
+                    "usage": {"reported": False, "input_tokens": 0, "output_tokens": 0, "raw": {}},
+                    "error": None,
+                },
+            ]
+            path = logger.append_turn(
+                question="q",
+                answer="answer",
+                pipeline="net",
+                calls=calls,
+                events=[{"ts_ns": 3, "event": "search_action", "data": {"action": "STOP"}}],
+                stats={"pipeline": "net"},
+            )
+            self.assertIsNotNone(path)
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            turn = data["turns"][0]
+            self.assertEqual(turn["question"], "q")
+            self.assertEqual(turn["answer"], "answer")
+            self.assertEqual(turn["token_usage"]["input_tokens"], 11)
+            self.assertEqual(turn["token_usage"]["output_tokens"], 7)
+            self.assertEqual(turn["token_usage"]["unreported_calls"], 1)
+            self.assertEqual(turn["thought_log"]["api_calls"][0]["provider"], "jev")
+            self.assertEqual(turn["thought_log"]["api_calls"][1]["response"]["reasoning"], reasoning)
+            self.assertEqual(turn["thought_log"]["jevnet_events"][0]["event"], "search_action")
+
     def test_score_uses_probability_mode_not_expected_score_rounding(self):
         answer = {"score": 2.49, "probabilities": {"1": 0.10, "2": 0.30, "3": 0.60}}
         self.assertEqual(score_level(answer, 6), 3)
@@ -92,7 +176,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(JevLLM._append_fragment("hel", "lo", "subword"), "hello")
 
     def test_engine_offline_integration(self):
-        config = Config(openrouter_api_key="x", upstage_api_key="y", default_run_mode="fast")
+        config = Config(
+            openrouter_api_key="x",
+            upstage_api_key="y",
+            default_run_mode="fast",
+            conversation_log_enabled=False,
+        )
         engine = JevLLM(config)
         engine.pipeline_mode = "legacy"
 
