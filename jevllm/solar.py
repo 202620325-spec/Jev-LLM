@@ -712,13 +712,48 @@ class SolarClient:
         return [chosen_blueprint]
 
     def direct_answer(self, *, user_text: str, history: list[dict[str, str]], reasoning_effort: str = "high", response_length: str = "medium") -> str:
-        _target, ceiling, _desc = next(((target, max_tokens, desc) for name, target, max_tokens, desc in RESPONSE_LENGTHS if name == response_length), (550, 1400, "normal"))
-        messages = [
-            {"role": "system", "content": "Answer the user directly, accurately, and naturally."},
-            *history[-8:],
-            {"role": "user", "content": user_text},
+        """Solar-only baseline with empty-surface recovery.
+
+        Keep the normal baseline as a single direct completion. Only when the API
+        succeeds but returns empty `content` do we retry with an explicit surface-
+        answer instruction and a larger output budget. This avoids turning ordinary
+        baseline runs into a multi-stage pipeline while making transient/reasoning-
+        only completions recoverable.
+        """
+        _target, ceiling, _desc = next(
+            ((target, max_tokens, desc) for name, target, max_tokens, desc in RESPONSE_LENGTHS if name == response_length),
+            (550, 1400, "normal"),
+        )
+        normal_system = "Answer the user directly, accurately, and naturally."
+        recovery_system = (
+            "Answer the user directly, accurately, and naturally. "
+            "Return a complete user-facing final answer in the content field. "
+            "Do not return only hidden reasoning and do not leave the answer empty."
+        )
+
+        attempts = [
+            (reasoning_effort, ceiling, normal_system),
+            ("medium", max(2048, ceiling * 2), recovery_system),
+            ("low", max(3072, ceiling * 2), recovery_system),
         ]
-        out = self.chat(messages, reasoning_effort=reasoning_effort, max_tokens=ceiling).text.strip()
-        if not out:
-            raise SolarError("Solar direct answer was empty")
-        return out
+
+        last_result: SolarResult | None = None
+        for effort, max_tokens, system in attempts:
+            messages = [
+                {"role": "system", "content": system},
+                *history[-8:],
+                {"role": "user", "content": user_text},
+            ]
+            last_result = self.chat(messages, reasoning_effort=effort, max_tokens=max_tokens)
+            out = (last_result.text or "").strip()
+            if out:
+                return out
+
+        finish_reason = None
+        if last_result is not None and isinstance(last_result.raw, dict):
+            try:
+                finish_reason = last_result.raw["choices"][0].get("finish_reason")
+            except (KeyError, IndexError, TypeError, AttributeError):
+                finish_reason = None
+        detail = f"; finish_reason={finish_reason}" if finish_reason else ""
+        raise SolarError(f"Solar direct answer remained empty after {len(attempts)} attempts{detail}")
