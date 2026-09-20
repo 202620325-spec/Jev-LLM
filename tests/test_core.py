@@ -820,6 +820,32 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(second["resolved"])
         self.assertEqual(second["winner_id"], "N0")
 
+    def test_revive_hides_current_hypotheses_from_solar_payload(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        observed = {}
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            payload = json.loads(messages[-1]["content"])
+            observed.update(payload)
+            return SolarResult(text='{"candidates":["fresh clean-room route"]}')
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.adaptive_reasoning_operation(
+            action="REVIVE",
+            user_text="q",
+            history=[],
+            plan={"route": ["solve independently"]},
+            parents=["entrenched false leader"],
+            existing=["entrenched false leader", "correlated rival"],
+            count=2,
+            round_index=2,
+            reasoning_effort="high",
+        )
+        self.assertEqual(observed["parent_blueprints"], [])
+        self.assertEqual(observed["existing_pool"], [])
+        self.assertEqual(out, ["fresh clean-room route"])
+
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
         solar = SolarClient(config)
