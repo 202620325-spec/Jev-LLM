@@ -367,5 +367,47 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(out, ["usable blueprint"])
 
+    def test_direct_answer_recovers_after_empty_surface_completion(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+        replies = iter([
+            SolarResult(text="", reasoning="internal reasoning"),
+            SolarResult(text="Recovered final answer."),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((messages, reasoning_effort, max_tokens))
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.direct_answer(
+            user_text="hard question", history=[],
+            reasoning_effort="high", response_length="medium",
+        )
+        self.assertEqual(out, "Recovered final answer.")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], "high")
+        self.assertEqual(calls[0][2], 1400)
+        self.assertEqual(calls[1][1], "medium")
+        self.assertGreaterEqual(calls[1][2], 2048)
+        self.assertIn("content field", calls[1][0][0]["content"])
+
+    def test_direct_answer_all_empty_is_bounded_and_reports_attempts(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((reasoning_effort, max_tokens))
+            return SolarResult(text="", raw={"choices": [{"finish_reason": "length"}]})
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        with self.assertRaisesRegex(Exception, "remained empty after 3 attempts"):
+            solar.direct_answer(user_text="q", history=[], response_length="medium")
+        self.assertEqual([x[0] for x in calls], ["high", "medium", "low"])
+        self.assertEqual(len(calls), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
