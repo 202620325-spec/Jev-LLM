@@ -42,7 +42,7 @@ class CoreTests(unittest.TestCase):
     def test_conversation_json_logger_preserves_reasoning_and_events_verbatim(self):
         with tempfile.TemporaryDirectory() as tmp:
             logger = ConversationJSONLogger(tmp)
-            reasoning = "line 1\nline 2\n{"raw": true}"
+            reasoning = 'line 1\\nline 2\\n{"raw": true}'
             calls = [
                 {
                     "ts_ns": 2,
