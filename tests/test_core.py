@@ -1154,6 +1154,69 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(net.last_stats["claim_audit_required"])
         self.assertGreaterEqual(len(net.last_stats["claim_audits"]), 3)
 
+    def test_simple_state_lock_cannot_promote_ungrounded_concepts(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return SolarResult(text=json.dumps({
+                "intent": "simple_definition",
+                "active_concepts": ["garde-manger", "cold kitchen", "catering hierarchy"],
+                "optional_concepts": ["salad", "automation robot"],
+                "required_claims": ["invented certification claim"],
+                "suppressed_concepts": ["inventory"],
+                "register": "casual_korean",
+                "abstraction": "concrete_definition",
+                "max_sentences": 2,
+                "max_chars": 180,
+            }))
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        blueprint = "garde-manger in charge means the cold kitchen section leader"
+        lock = solar.build_state_lock(
+            user_text="가드망 인차지가 요리업계에서 뭐냐",
+            history=[],
+            plan={"query_mode": "simple_definition"},
+            chosen_blueprint=blueprint,
+            query_mode="simple_definition",
+        )
+        self.assertEqual(lock["required_claims"], [blueprint])
+        self.assertIn("garde-manger", lock["active_concepts"])
+        self.assertIn("cold kitchen", lock["active_concepts"])
+        self.assertNotIn("catering hierarchy", lock["active_concepts"])
+        self.assertNotIn("automation robot", lock["optional_concepts"])
+
+    def test_simple_definition_refill_stays_grounded(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        observed = {}
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            observed["payload"] = json.loads(messages[-1]["content"])
+            observed["effort"] = reasoning_effort
+            observed["max_tokens"] = max_tokens
+            return SolarResult(text='{"candidates":["cold-kitchen section leader"]}')
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.adaptive_reasoning_operation(
+            action="REFILL",
+            user_text="가드망 인차지가 요리업계에서 뭐냐",
+            history=[],
+            plan={"query_mode": "simple_definition"},
+            parents=["garde-manger cold-kitchen lead"],
+            existing=["garde-manger cold-kitchen lead"],
+            count=2,
+            round_index=0,
+            reasoning_effort="high",
+            generation_mode="simple_definition",
+        )
+        self.assertEqual(out, ["cold-kitchen section leader"])
+        self.assertEqual(observed["payload"]["generation_mode"], "simple_definition")
+        self.assertEqual(observed["effort"], "low")
+        self.assertLessEqual(observed["max_tokens"], 1800)
+        reqs = " ".join(observed["payload"]["requirements"])
+        self.assertIn("Do not invent alternative senses", reqs)
+
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
         solar = SolarClient(config)
