@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from .config import Config
 from .jev import JevClient
+from .sanity import hard_sanity_issues
 from .solar import SolarClient
 
 
@@ -266,6 +267,9 @@ class JevDecisionNetwork:
 
         generated_total = len(nodes)
         action_history: list[dict[str, Any]] = []
+        sanity_vetoes = 0
+        sanity_flagged_finalists = 0
+        sanity_flagged_drafts = 0
         stop_reason = "round_cap"
         self.emit("expansion", {"generation": 0, "nodes": [vars(n) for n in nodes]})
 
@@ -322,6 +326,41 @@ class JevDecisionNetwork:
             if action not in allowed_actions:
                 # Only the external compute envelope may overrule Jev.
                 action = "STOP"
+
+            # Deterministic STOP gate. Jev remains the search controller, but it
+            # cannot finalize a leader containing a provable arithmetic
+            # contradiction such as exact 75% accuracy over 5 discrete items.
+            requested_action = action
+            decision["jev_action"] = requested_action
+            if action == "STOP" and rounds_left > 0 and nodes:
+                leader = max(nodes, key=lambda n: (n.activation, n.survival, -n.uncertainty))
+                issues = hard_sanity_issues(leader.text)
+                if issues:
+                    forced_action = (
+                        "CHALLENGE" if "CHALLENGE" in allowed_actions
+                        else "VERIFY" if "VERIFY" in allowed_actions
+                        else None
+                    )
+                    if forced_action is not None:
+                        action = forced_action
+                        sanity_vetoes += 1
+                        decision["sanity_veto"] = True
+                        decision["sanity_issues"] = [
+                            {"code": issue.code, "message": issue.message, "evidence": issue.evidence}
+                            for issue in issues
+                        ]
+                        decision["focus_id"] = leader.id
+                        decision["target_span"] = max(1, int(decision.get("target_span", 2)))
+                        if action == "CHALLENGE":
+                            decision["refill_count"] = max(2, int(decision.get("refill_count", 2)))
+                        self.emit("sanity_gate", {
+                            "round": round_index + 1,
+                            "candidate_id": leader.id,
+                            "requested_action": requested_action,
+                            "forced_action": action,
+                            "issues": decision["sanity_issues"],
+                        })
+
             decision["action"] = action
             action_history.append({k: v for k, v in decision.items() if k != "raw"})
             self.emit("search_action", {
@@ -396,7 +435,36 @@ class JevDecisionNetwork:
             raise RuntimeError("JevNet candidate pool became empty")
 
         nodes = sorted(nodes, key=lambda n: (n.activation, n.survival, -n.uncertainty), reverse=True)
-        finalists = nodes[: min(8, len(nodes))]
+
+        # Do not hand a provably inconsistent candidate to the final selector when
+        # at least one clean alternative survived.
+        clean_nodes: list[CandidateNode] = []
+        flagged_nodes: list[tuple[CandidateNode, list[Any]]] = []
+        for node in nodes:
+            issues = hard_sanity_issues(node.text)
+            if issues:
+                flagged_nodes.append((node, issues))
+            else:
+                clean_nodes.append(node)
+        sanity_flagged_finalists = len(flagged_nodes)
+        selection_nodes = clean_nodes if clean_nodes else nodes
+        finalists = selection_nodes[: min(8, len(selection_nodes))]
+
+        if flagged_nodes:
+            self.emit("sanity_finalists", {
+                "flagged": [
+                    {
+                        "candidate_id": node.id,
+                        "issues": [
+                            {"code": issue.code, "message": issue.message, "evidence": issue.evidence}
+                            for issue in issues
+                        ],
+                    }
+                    for node, issues in flagged_nodes[:8]
+                ],
+                "clean_available": bool(clean_nodes),
+            })
+
         chosen_plan_idx, plan_raw = self.jev.choose_blueprint(
             user_text=user_text,
             plan=plan,
@@ -424,16 +492,64 @@ class JevDecisionNetwork:
             raise RuntimeError("Solar produced zero final answer drafts")
         self.emit("final_drafts", {"drafts": drafts})
 
-        if len(drafts) == 1:
-            selected = 0
-            final_raw: dict[str, Any] = {}
+        clean_draft_pairs: list[tuple[int, str]] = []
+        draft_issues: list[tuple[int, list[Any]]] = []
+        for i, draft in enumerate(drafts):
+            issues = hard_sanity_issues(draft)
+            if issues:
+                draft_issues.append((i, issues))
+            else:
+                clean_draft_pairs.append((i, draft))
+        sanity_flagged_drafts = len(draft_issues)
+
+        if draft_issues:
+            self.emit("sanity_drafts", {
+                "flagged": [
+                    {
+                        "index": i,
+                        "issues": [
+                            {"code": issue.code, "message": issue.message, "evidence": issue.evidence}
+                            for issue in issues
+                        ],
+                    }
+                    for i, issues in draft_issues
+                ],
+                "clean_available": bool(clean_draft_pairs),
+            })
+
+        if clean_draft_pairs:
+            clean_drafts = [draft for _, draft in clean_draft_pairs]
+            if len(clean_drafts) == 1:
+                clean_selected = 0
+                final_raw: dict[str, Any] = {"sanity_filtered": sanity_flagged_drafts}
+            else:
+                clean_selected, final_raw = self.jev.choose_final_answer(
+                    user_text=user_text,
+                    plan=plan,
+                    drafts=clean_drafts,
+                )
+            selected = clean_draft_pairs[clean_selected][0]
+            answer = drafts[selected]
+        elif not hard_sanity_issues(chosen_blueprint):
+            # Surface rendering introduced a deterministic contradiction into
+            # every draft. Prefer the already-selected clean blueprint to knowingly
+            # returning impossible arithmetic.
+            selected = -1
+            final_raw = {"sanity_fallback": "chosen_blueprint"}
+            answer = chosen_blueprint
         else:
-            selected, final_raw = self.jev.choose_final_answer(
-                user_text=user_text,
-                plan=plan,
-                drafts=drafts,
-            )
-        answer = drafts[selected]
+            # No deterministic clean alternative exists within the compute cap.
+            # Preserve previous behavior rather than fabricating a repair.
+            if len(drafts) == 1:
+                selected = 0
+                final_raw = {"sanity_exhausted": True}
+            else:
+                selected, final_raw = self.jev.choose_final_answer(
+                    user_text=user_text,
+                    plan=plan,
+                    drafts=drafts,
+                )
+            answer = drafts[selected]
         self.emit("final_selection", {"index": selected, "raw": final_raw, "answer": answer})
 
         self.last_stats = {
@@ -445,6 +561,9 @@ class JevDecisionNetwork:
             "final_drafts": len(drafts),
             "adaptive_actions": [d.get("action") for d in action_history],
             "action_history": action_history,
+            "sanity_vetoes": sanity_vetoes,
+            "sanity_flagged_finalists": sanity_flagged_finalists,
+            "sanity_flagged_drafts": sanity_flagged_drafts,
             "stop_reason": stop_reason,
             "solar_calls": self.solar.call_count,
             "jev_calls": self.jev.call_count,
