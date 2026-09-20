@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import asdict
 from typing import Any, Callable
 
+from .audit import ConversationJSONLogger
 from .config import Config
 from .controller import AdaptiveController
 from .jev import JevClient
@@ -22,6 +24,12 @@ class JevLLM:
         self.solar = SolarClient(config)
         self.history: list[dict[str, str]] = []
         self.event_sink = event_sink or (lambda _event, _data: None)
+        self.audit_events: list[dict[str, Any]] = []
+        self.conversation_logger = ConversationJSONLogger(
+            config.conversation_log_dir,
+            enabled=config.conversation_log_enabled,
+        )
+        self.last_log_path: str | None = None
 
         self.pipeline_mode = "net"       # net | solar | legacy
         self.intensity = "auto"          # auto | fast | full | max
@@ -34,10 +42,16 @@ class JevLLM:
         self.run_mode = config.default_run_mode  # legacy only
         self.last_stats: dict[str, Any] = {}
 
-        self.network = JevDecisionNetwork(config, self.jev, self.solar, self.event_sink)
+        self.network = JevDecisionNetwork(config, self.jev, self.solar, self._capture_event)
 
     def reset(self) -> None:
         self.history.clear()
+        self.audit_events.clear()
+        self.conversation_logger = ConversationJSONLogger(
+            self.config.conversation_log_dir,
+            enabled=self.config.conversation_log_enabled,
+        )
+        self.last_log_path = None
 
     def clear_overrides(self) -> None:
         self.width_override = None
@@ -48,8 +62,54 @@ class JevLLM:
         self.generated_override = None
         self.intensity = "auto"
 
-    def _emit(self, event: str, **data: Any) -> None:
+    def _capture_event(self, event: str, data: dict[str, Any]) -> None:
+        self.audit_events.append({
+            "ts_ns": time.time_ns(),
+            "event": event,
+            "data": data,
+        })
         self.event_sink(event, data)
+
+    def _emit(self, event: str, **data: Any) -> None:
+        self._capture_event(event, data)
+
+    def audit_cursor(self) -> dict[str, int]:
+        return {
+            "solar": len(getattr(self.solar, "audit_calls", [])),
+            "jev": len(getattr(self.jev, "audit_calls", [])),
+            "events": len(self.audit_events),
+        }
+
+    def _audit_slice(self, cursor: dict[str, int]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        solar_calls = list(getattr(self.solar, "audit_calls", []))[cursor.get("solar", 0):]
+        jev_calls = list(getattr(self.jev, "audit_calls", []))[cursor.get("jev", 0):]
+        calls = solar_calls + jev_calls
+        events = self.audit_events[cursor.get("events", 0):]
+        return calls, events
+
+    def record_turn_log(
+        self,
+        *,
+        question: str,
+        answer: Any,
+        pipeline: str,
+        cursor: dict[str, int],
+        extra: dict[str, Any] | None = None,
+    ) -> str | None:
+        calls, events = self._audit_slice(cursor)
+        path = self.conversation_logger.append_turn(
+            question=question,
+            answer=answer,
+            pipeline=pipeline,
+            calls=calls,
+            events=events,
+            stats=dict(self.last_stats),
+            extra=extra,
+        )
+        self.last_log_path = str(path) if path is not None else None
+        if self.last_log_path is not None:
+            self.last_stats["conversation_log"] = self.last_log_path
+        return self.last_log_path
 
     def _remember(self, user_text: str, answer: str) -> None:
         self.history.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": answer}])
@@ -57,19 +117,35 @@ class JevLLM:
         if len(self.history) > max_messages:
             self.history = self.history[-max_messages:]
 
-    def answer(self, user_text: str) -> str:
+    def answer(self, user_text: str, *, log_turn: bool = True) -> str:
         if not user_text.strip():
             return ""
+        audit_cursor = self.audit_cursor()
 
         if self.pipeline_mode == "solar":
             start_solar = getattr(self.solar, "call_count", 0)
             answer = self.solar.direct_answer(user_text=user_text, history=self.history, reasoning_effort="high", response_length="medium")
             self.last_stats = {"pipeline": "solar", "solar_calls": getattr(self.solar, "call_count", start_solar) - start_solar, "jev_calls": 0}
             self._remember(user_text, answer)
+            if log_turn:
+                self.record_turn_log(
+                    question=user_text,
+                    answer=answer,
+                    pipeline="solar",
+                    cursor=audit_cursor,
+                )
             return answer
 
         if self.pipeline_mode == "legacy":
-            return self._answer_legacy(user_text)
+            answer = self._answer_legacy(user_text)
+            if log_turn:
+                self.record_turn_log(
+                    question=user_text,
+                    answer=answer,
+                    pipeline="legacy",
+                    cursor=audit_cursor,
+                )
+            return answer
 
         start_solar = getattr(self.solar, "call_count", 0)
         start_jev = getattr(self.jev, "call_count", 0)
@@ -96,6 +172,13 @@ class JevLLM:
             "jev_calls_this_turn": getattr(self.jev, "call_count", start_jev) - start_jev,
         })
         self._remember(user_text, answer)
+        if log_turn:
+            self.record_turn_log(
+                question=user_text,
+                answer=answer,
+                pipeline="net",
+                cursor=audit_cursor,
+            )
         return answer
 
     @staticmethod
