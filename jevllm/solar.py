@@ -8,6 +8,7 @@ import requests
 
 from .audit import make_call_record
 from .config import Config
+from .routing import classify_query_mode
 from .types import RESPONSE_LENGTHS, SolarResult, Usage
 from .util import extract_json, recover_candidate_strings
 
@@ -129,6 +130,19 @@ class SolarClient:
         "Answer directly" fallback erased exactly the constraints JevNet needed
         in hard problems, so planning now gets one bounded repair attempt.
         """
+        mode = classify_query_mode(user_text)
+        if mode == "simple_definition":
+            return {
+                "intent": "simple_definition",
+                "route": ["identify conventional meaning", "state it directly"],
+                "required_points": [],
+                "verification_needs": [],
+                "answer_shape": "1-2 sentence concrete definition",
+                "risk_or_uncertainty": [],
+                "language": "match_user",
+                "query_mode": "simple_definition",
+            }
+
         recent = history[-8:]
         system = (
             "You are the route planner inside a hybrid Jev+Solar language model. "
@@ -195,6 +209,7 @@ class SolarClient:
         parsed.setdefault("verification_needs", [])
         parsed.setdefault("answer_shape", "direct answer")
         parsed.setdefault("risk_or_uncertainty", [])
+        parsed.setdefault("query_mode", mode)
         return parsed
 
     @staticmethod
@@ -658,6 +673,206 @@ class SolarClient:
         if out:
             return out
         return parents[:1]
+
+    def audit_claims(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        text: str,
+        stage: str,
+        verification_evidence: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Audit atomic support claims independently of the selected conclusion.
+
+        A correct conclusion with a false proof is a failed audit. Exact counts,
+        parity/invariant claims, ranks, state-space sizes, exhaustive-search claims,
+        constructions, and algebraic identities must be recomputed or downgraded.
+        """
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-4:],
+            "route": plan,
+            "stage": stage,
+            "text_to_audit": text,
+            "prior_verified_evidence": verification_evidence or [],
+            "rules": [
+                "Separate the final conclusion from the claims used to support it.",
+                "A correct conclusion does NOT excuse a false supporting claim.",
+                "Extract every answer-changing or proof-supporting factual/logical claim.",
+                "For exact counts, arithmetic, parity, ranks, dimensions, state-space sizes, BFS/exhaustive-search claims, and constructions: recompute or derive them from the original problem instead of trusting the text.",
+                "For a construction, replay it against the actual rules.",
+                "For an invariant, explicitly check one allowed operation preserves it.",
+                "For a rank/dimension claim, require an actual derivation/certificate; otherwise mark UNCERTAIN and remove it from the proof.",
+                "PASS only when the check is externally inspectable. Plausibility is not verification.",
+                "If a claim is wrong or unnecessary and unverifiable, produce a repaired compact answer/proof that removes or replaces it.",
+                "Do not reveal private chain-of-thought; evidence must be concise, checkable results only.",
+            ],
+            "output_schema": {
+                "conclusion": "short statement of the text's conclusion",
+                "conclusion_status": "PASS | FAIL | UNCERTAIN",
+                "claims": [
+                    {
+                        "claim": "atomic supporting claim",
+                        "importance": "ANSWER_CHANGING | SUPPORTING | OPTIONAL",
+                        "verdict": "PASS | FAIL | UNCERTAIN",
+                        "check_kind": "ARITHMETIC | DERIVATION | INVARIANT | CONSTRUCTION | ENUMERATION | EXTERNAL_REQUIRED | OTHER",
+                        "check": "what was actually checked",
+                        "evidence": "concise checkable result",
+                    }
+                ],
+                "repaired_text": "compact corrected answer/proof, or empty string if no repair is needed",
+            },
+        }
+        system = (
+            "You are a claim-level proof auditor. Audit the support structure, not the prose style. "
+            "The selected conclusion may be right while its proof is wrong. Return strict JSON only."
+        )
+        last_text = ""
+        for effort, max_tokens in [("high", 4200), ("medium", 3000)]:
+            result = self.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                reasoning_effort=effort,
+                max_tokens=max_tokens,
+            )
+            last_text = (result.text or "").strip()
+            if not last_text:
+                continue
+            try:
+                parsed = extract_json(last_text)
+            except (ValueError, json.JSONDecodeError):
+                parsed = None
+            if not isinstance(parsed, dict):
+                continue
+
+            cleaned: list[dict[str, str]] = []
+            for item in parsed.get("claims") or []:
+                if not isinstance(item, dict):
+                    continue
+                claim = " ".join(str(item.get("claim", "")).split())
+                if not claim:
+                    continue
+                importance = str(item.get("importance", "SUPPORTING")).upper()
+                if importance not in {"ANSWER_CHANGING", "SUPPORTING", "OPTIONAL"}:
+                    importance = "SUPPORTING"
+                verdict = str(item.get("verdict", "UNCERTAIN")).upper()
+                if verdict not in {"PASS", "FAIL", "UNCERTAIN"}:
+                    verdict = "UNCERTAIN"
+                check_kind = str(item.get("check_kind", "OTHER")).upper()
+                check = str(item.get("check", "")).strip()
+                evidence = str(item.get("evidence", "")).strip()
+
+                # A bare PASS with no actual check/evidence is not verification.
+                if verdict == "PASS" and (len(check) < 4 or len(evidence) < 3):
+                    verdict = "UNCERTAIN"
+                if check_kind == "EXTERNAL_REQUIRED" and verdict == "PASS":
+                    verdict = "UNCERTAIN"
+
+                cleaned.append({
+                    "claim": claim,
+                    "importance": importance,
+                    "verdict": verdict,
+                    "check_kind": check_kind,
+                    "check": check,
+                    "evidence": evidence,
+                })
+
+            conclusion_status = str(parsed.get("conclusion_status", "UNCERTAIN")).upper()
+            if conclusion_status not in {"PASS", "FAIL", "UNCERTAIN"}:
+                conclusion_status = "UNCERTAIN"
+
+            material = [x for x in cleaned if x["importance"] in {"ANSWER_CHANGING", "SUPPORTING"}]
+            failed = [x for x in material if x["verdict"] == "FAIL"]
+            uncertain = [x for x in material if x["verdict"] == "UNCERTAIN"]
+            if failed:
+                status = "FAIL"
+            elif uncertain or (not material and stage in {"blueprint", "surface"}):
+                status = "UNCERTAIN"
+            elif conclusion_status == "FAIL":
+                status = "FAIL"
+            elif conclusion_status == "UNCERTAIN":
+                status = "UNCERTAIN"
+            else:
+                status = "PASS"
+
+            repaired = str(parsed.get("repaired_text") or "").strip()
+            return {
+                "status": status,
+                "conclusion": str(parsed.get("conclusion") or "").strip(),
+                "conclusion_status": conclusion_status,
+                "claims": cleaned,
+                "failed_claims": failed,
+                "uncertain_claims": uncertain,
+                "repaired_text": repaired,
+                "raw": parsed,
+            }
+
+        return {
+            "status": "UNCERTAIN",
+            "conclusion": "",
+            "conclusion_status": "UNCERTAIN",
+            "claims": [],
+            "failed_claims": [],
+            "uncertain_claims": [],
+            "repaired_text": "",
+            "raw_text": last_text,
+        }
+
+    def repair_from_claim_audit(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        text: str,
+        audit: dict[str, Any],
+        verification_evidence: list[dict[str, Any]] | None = None,
+        response_length: str = "medium",
+    ) -> str:
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-4:],
+            "route": plan,
+            "text_to_repair": text,
+            "claim_audit": {
+                "status": audit.get("status"),
+                "failed_claims": audit.get("failed_claims") or [],
+                "uncertain_claims": audit.get("uncertain_claims") or [],
+                "conclusion_status": audit.get("conclusion_status"),
+            },
+            "verified_evidence": verification_evidence or [],
+            "requirements": [
+                "Keep a conclusion only if it remains supported.",
+                "Remove every FAIL claim.",
+                "Remove or replace every material UNCERTAIN claim instead of presenting it as fact.",
+                "Prefer the shortest proof/argument whose key steps can actually be checked.",
+                "Do not introduce new exact counts, ranks, dimensions, BFS/state-space claims, invariants, or constructions unless you explicitly derive/check them.",
+                "Return only the repaired user-facing answer.",
+            ],
+        }
+        _target, ceiling, _desc = next(
+            ((target, max_tokens, desc) for name, target, max_tokens, desc in RESPONSE_LENGTHS if name == response_length),
+            (550, 1400, "normal"),
+        )
+        result = self.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Repair the answer using the claim audit. Correctness of the proof has priority over "
+                        "coverage or sophistication. Return only the repaired answer."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            reasoning_effort="high",
+            max_tokens=max(2200, ceiling * 2),
+        )
+        return (result.text or "").strip() or str(audit.get("repaired_text") or "").strip() or text
 
     def discriminate_hypotheses(
         self,
