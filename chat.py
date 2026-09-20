@@ -75,6 +75,15 @@ def make_event_sink(state: dict[str, bool]):
             print(f"[VERIFY] re-checked {len(data.get('nodes', []))} candidates")
             return
 
+        if event == "surface_render" and state["trace"]:
+            s = data.get("stats", {})
+            print(
+                f"[Surface] protocol={s.get('protocol')} drafts={s.get('drafts')} "
+                f"repaired={s.get('repaired')} rejected={s.get('rejected', 0)} "
+                f"finish={s.get('finish_reason')}"
+            )
+            return
+
         if not state["debug"]:
             return
 
@@ -106,6 +115,8 @@ def make_event_sink(state: dict[str, bool]):
                 )
         elif event == "blueprint_selection":
             print(f"[Jev blueprint] C{data['index']} -> {data['blueprint']}")
+        elif event == "surface_render":
+            print("[Surface render]", json.dumps(data.get("stats", {}), ensure_ascii=False, indent=2))
         elif event == "final_drafts":
             for i, d in enumerate(data["drafts"]):
                 print(f"[Draft {i}] {d}")
