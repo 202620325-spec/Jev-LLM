@@ -23,15 +23,15 @@ class JevLLM:
         self.history: list[dict[str, str]] = []
         self.event_sink = event_sink or (lambda _event, _data: None)
 
-        self.pipeline_mode = "net"
-        self.intensity = "auto"
+        self.pipeline_mode = "net"       # net | solar | legacy
+        self.intensity = "auto"          # auto | fast | full | max
         self.width_override: int | None = None
         self.layers_override: int | None = None
         self.drafts_override: int | None = None
-        self.mutation_override: int | None = None
+        self.mutation_override: int | None = None  # max refill per action in v1.3
         self.seed_override: int | None = None
         self.generated_override: int | None = None
-        self.run_mode = config.default_run_mode
+        self.run_mode = config.default_run_mode  # legacy only
         self.last_stats: dict[str, Any] = {}
 
         self.network = JevDecisionNetwork(config, self.jev, self.solar, self.event_sink)
@@ -134,8 +134,7 @@ class JevLLM:
         )
         for step in range(hard_cap):
             raw_profile = self.jev.controls(user_text=user_text, history=self.history, plan=plan, prefix=prefix, step=step)
-            adaptive = controller.update(raw_profile)
-            final_adaptive = adaptive
+            adaptive = controller.update(raw_profile); final_adaptive = adaptive
             if MODE_RANK[adaptive.cognitive_mode] > MODE_RANK[highest_mode]:
                 highest_mode = adaptive.cognitive_mode
             horizon_rule = HORIZONS[adaptive.horizon_index][1]
