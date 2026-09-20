@@ -17,7 +17,7 @@ BANNER = r"""
  JEVNET -> LLM v1.4 | Evidence-gated Jev search over Solar proposal space
 ======================================================================
  Jev decides: STOP / REFILL / DIVERSE / DEEPEN / MUTATE / MERGE /
-              CHALLENGE / VERIFY
+              CHALLENGE / REVIVE / VERIFY
  Default: :net + :auto
  Type :help for commands.
 """.strip()
@@ -211,7 +211,8 @@ JEV META ACTIONS
   MUTATE           repair weak assumptions / constraints
   MERGE            combine complementary survivors
   CHALLENGE        adversarial alternatives / counterexamples
-  VERIFY           Jev-only stricter re-check; no new Solar candidates
+  REVIVE           clean-room hypotheses; current pool hidden from Solar
+  VERIFY           one discriminating evidence test; never same-pool confidence loop
 """.strip())
 
 
