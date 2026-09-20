@@ -448,8 +448,8 @@ class CoreTests(unittest.TestCase):
         calls = []
         raw = (
             '{"candidates":['
-            '"The minimum is 5; here is a complete construction and minimality proof.",'
-            '"n=5. A full alternative construction follows, together with the lower-bound proof."'
+            '"The minimum is 5. Here is a complete construction assigning correctness patterns to all examples, followed by a lower-bound argument proving that every smaller n is impossible.",'
+            '"n=5. This alternative gives the full classifier table, checks each individual accuracy and the majority-vote accuracy, then proves minimality by exhausting the smaller integer cases."'
             ']}'
         )
 
