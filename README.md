@@ -1,4 +1,4 @@
-# JevNet -> LLM v1.4.0
+# JevNet -> LLM v1.5.0
 
 CMD chat MVP combining:
 
@@ -158,6 +158,58 @@ A trace can look like:
 [Jev action R4] STOP ... ready=0.92
 ```
 
+## v1.5: STATE LOCK + claim-level proof audit
+
+v1.5 separates two failure classes that should not be solved by the same mechanism.
+
+### Simple-definition path
+
+High-confidence definition queries such as `What is X?` or Korean `X가 뭐냐` are routed through a small deterministic envelope:
+
+```text
+query router
+  -> <=3 grounded definition seeds
+  -> lightweight Jev evaluation
+     - semantic fit
+     - correctness
+     - scope discipline
+     - directness
+  -> one selected blueprint
+  -> STATE LOCK
+  -> Solar verbalizer (one draft only)
+  -> Jev state-conformance gate
+```
+
+The state lock contains required/active/optional/suppressed concepts, register, abstraction and hard surface budgets. The final Solar call does not receive losing blueprints and is explicitly forbidden from opening new factual branches.
+
+Low-confidence final argmax is no longer accepted blindly: multi-draft decisions below 0.50 confidence fall back toward the selected blueprint and concise wording.
+
+### Proof / derivation path
+
+Proof-like requests now receive a claim-level audit even when competing candidates agree on the same conclusion.
+
+```text
+selected conclusion/proof
+  -> extract atomic support claims
+  -> recompute/check counts, parity, invariants, ranks,
+     state-space/BFS claims and constructions
+  -> conclusion can PASS while proof still FAILS
+  -> remove/repair FAIL and material UNCERTAIN claims
+  -> re-audit
+  -> render one answer
+  -> audit the user-facing surface again
+```
+
+This prevents a correct conclusion from laundering false support such as a wrong cell count or unsupported GF(2) rank.
+
+### Cost control
+
+- simple definitions skip the Solar route-planner API call;
+- simple definitions cap seed=3, rounds=2, generated=6, drafts=1;
+- simple-definition candidate evaluation uses four compact metrics instead of the full seven-metric battery;
+- shared request/plan context is sent once per Jev batch rather than duplicated inside every candidate record;
+- normal evidence-gated v1.4 behavior remains for difficult reasoning tasks.
+
 ## v1.4: disagreement before collapse
 
 v1.4 changes VERIFY from repeated Jev plausibility scoring into evidence acquisition.
@@ -232,7 +284,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.4.0 regression suite currently defines **34 tests**.
+v1.5.0 regression suite currently defines **41 tests**.
 
 Run locally:
 
