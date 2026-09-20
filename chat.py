@@ -75,6 +75,22 @@ def make_event_sink(state: dict[str, bool]):
             print(f"[VERIFY] re-checked {len(data.get('nodes', []))} candidates")
             return
 
+        if event == "sanity_gate" and state["trace"]:
+            issues = data.get("issues", [])
+            first = issues[0].get("message", "deterministic contradiction") if issues else "deterministic contradiction"
+            print(
+                f"[Sanity R{data['round']}] veto {data['requested_action']} -> {data['forced_action']} "
+                f"| {data['candidate_id']}: {first}"
+            )
+            return
+
+        if event == "sanity_drafts" and state["trace"]:
+            print(
+                f"[Sanity final] rejected {len(data.get('flagged', []))} draft(s) "
+                f"| clean_available={data.get('clean_available')}"
+            )
+            return
+
         if not state["debug"]:
             return
 
@@ -111,6 +127,12 @@ def make_event_sink(state: dict[str, bool]):
                 print(f"[Draft {i}] {d}")
         elif event == "final_selection":
             print(f"[Jev final] draft={data['index']}")
+        elif event == "sanity_gate":
+            print("[Deterministic sanity veto]", json.dumps(data, ensure_ascii=False, indent=2))
+        elif event == "sanity_finalists":
+            print("[Sanity finalist filter]", json.dumps(data, ensure_ascii=False, indent=2))
+        elif event == "sanity_drafts":
+            print("[Sanity draft filter]", json.dumps(data, ensure_ascii=False, indent=2))
         elif event == "control":
             a = data["adaptive"]
             print(
