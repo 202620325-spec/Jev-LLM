@@ -285,7 +285,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.5.0 regression suite currently defines **41 tests**.
+v1.5.0 regression suite currently defines **43 tests**.
 
 Run locally:
 
