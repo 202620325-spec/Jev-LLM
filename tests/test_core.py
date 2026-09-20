@@ -8,6 +8,7 @@ from jevllm.config import Config
 from jevllm.controller import AdaptiveController
 from jevllm.engine import JevLLM
 from jevllm.jevnet import JevDecisionNetwork
+from jevllm.routing import classify_query_mode, needs_claim_audit
 from jevllm.solar import SolarClient
 from jevllm.types import ControlProfile, SolarResult
 from jevllm.util import extract_json, recover_candidate_strings, score_expectation, score_level
@@ -845,6 +846,313 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(observed["parent_blueprints"], [])
         self.assertEqual(observed["existing_pool"], [])
         self.assertEqual(out, ["fresh clean-room route"])
+
+    def test_query_router_detects_simple_definition_and_proof(self):
+        self.assertEqual(
+            classify_query_mode("가드망 인차지가 요리업계에서 뭐냐"),
+            "simple_definition",
+        )
+        self.assertEqual(
+            classify_query_mode("What is dopamine-driven development?"),
+            "simple_definition",
+        )
+        self.assertEqual(
+            classify_query_mode("이 상태가 불가능함을 증명하라"),
+            "reasoning",
+        )
+        self.assertTrue(needs_claim_audit("Find the rank and prove minimality."))
+
+    def test_simple_definition_plan_uses_no_solar_call(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        def fail_chat(*args, **kwargs):
+            raise AssertionError("simple-definition planner must be deterministic")
+
+        solar.chat = fail_chat  # type: ignore[method-assign]
+        plan = solar.plan("가드망 인차지가 요리업계에서 뭐냐", [])
+        self.assertEqual(plan["query_mode"], "simple_definition")
+        self.assertEqual(plan["answer_shape"], "1-2 sentence concrete definition")
+
+    def test_simple_definition_seed_does_not_force_invented_diversity(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        observed = {}
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            observed["system"] = messages[0]["content"]
+            observed["payload"] = json.loads(messages[-1]["content"])
+            observed["reasoning_effort"] = reasoning_effort
+            observed["max_tokens"] = max_tokens
+            return SolarResult(text='{"candidates":["garde-manger cold kitchen lead","cold-kitchen section person in charge"]}')
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.expand_reasoning_paths(
+            user_text="가드망 인차지가 요리업계에서 뭐냐",
+            history=[],
+            plan={"query_mode": "simple_definition"},
+            count=3,
+            stage="seed",
+            reasoning_effort="high",
+            generation_mode="simple_definition",
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(observed["reasoning_effort"], "low")
+        self.assertLessEqual(observed["max_tokens"], 1800)
+        reqs = " ".join(observed["payload"]["requirements"])
+        self.assertIn("Do not invent speculative alternate senses", reqs)
+        self.assertIn("Never manufacture diversity", observed["system"])
+
+    def test_state_lock_surface_repairs_suppressed_expansion(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        replies = iter([
+            SolarResult(
+                text="가드망 인차지는 콜드키친 책임자고 메뉴 기획과 재고·행사 케이터링까지 총괄해.",
+                raw={"choices": [{"finish_reason": "stop"}]},
+            ),
+            SolarResult(
+                text="가드망 인차지는 그냥 콜드키친(찬 요리) 파트 책임자야.",
+                raw={"choices": [{"finish_reason": "stop"}]},
+            ),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        lock = {
+            "required_claims": ["garde-manger in charge means cold-kitchen section leader"],
+            "active_concepts": ["garde-manger", "cold kitchen", "section leader"],
+            "optional_concepts": ["찬 요리"],
+            "suppressed_concepts": ["메뉴 기획", "재고", "케이터링"],
+            "register": "casual_korean",
+            "abstraction": "concrete_definition",
+            "max_sentences": 2,
+            "max_chars": 140,
+            "allow_new_factual_concepts": False,
+        }
+        out = solar.render_answer_drafts(
+            user_text="가드망 인차지가 요리업계에서 뭐냐",
+            history=[],
+            plan={"query_mode": "simple_definition"},
+            chosen_blueprint="cold-kitchen section leader",
+            supporting_blueprints=[],
+            count=1,
+            response_length="micro",
+            reasoning_effort="low",
+            state_lock=lock,
+        )
+        self.assertEqual(out, ["가드망 인차지는 그냥 콜드키친(찬 요리) 파트 책임자야."])
+
+    def test_claim_audit_fails_false_proof_even_when_conclusion_passes(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        raw = {
+            "conclusion": "exactly one lit bulb is impossible",
+            "conclusion_status": "PASS",
+            "claims": [
+                {
+                    "claim": "one operation flips 10 cells",
+                    "importance": "SUPPORTING",
+                    "verdict": "FAIL",
+                    "check_kind": "ARITHMETIC",
+                    "check": "count row plus column with one shared intersection",
+                    "evidence": "5 + 5 - 1 = 9, not 10",
+                },
+                {
+                    "claim": "GF(2) rank is 7",
+                    "importance": "SUPPORTING",
+                    "verdict": "FAIL",
+                    "check_kind": "DERIVATION",
+                    "check": "row-reduce the 25 operation vectors",
+                    "evidence": "rank is 17",
+                },
+            ],
+            "repaired_text": "The conclusion is impossible; use the equal-row-parity invariant instead.",
+        }
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return SolarResult(text=json.dumps(raw))
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        audit = solar.audit_claims(
+            user_text="불가능하면 증명하라",
+            history=[],
+            plan={},
+            text="불가능하다. 한 번에 10칸이고 rank=7이다.",
+            stage="surface",
+        )
+        self.assertEqual(audit["conclusion_status"], "PASS")
+        self.assertEqual(audit["status"], "FAIL")
+        self.assertEqual(len(audit["failed_claims"]), 2)
+
+    def test_simple_definition_jevnet_uses_state_lock_and_single_draft(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        seen = {"seed_count": None, "generation_mode": None, "final_choose": 0}
+
+        class FakeJev:
+            def __init__(self): self.call_count = 0
+            def evaluate_candidate_batch(self, *, candidates, evaluation_mode=None, **kwargs):
+                self.call_count += 1
+                self.assert_mode = evaluation_mode
+                return [
+                    {
+                        "activation": 0.9 - i * 0.05,
+                        "survival": 0.9,
+                        "uncertainty": 0.1,
+                        "metrics": {"correctness": 0.9, "scope_discipline": 0.9},
+                    }
+                    for i, _ in enumerate(candidates)
+                ]
+            def search_action(self, *, allowed_actions, **kwargs):
+                self.call_count += 1
+                self.allowed = allowed_actions
+                return {"action": "STOP", "refill_count": 2, "target_span": 1, "focus_id": "POOL"}
+            def choose_blueprint(self, **kwargs):
+                self.call_count += 1
+                return 0, {"answers": {"winner": {"choice": "C0", "confidence": 0.9}}}
+            def choose_final_answer(self, **kwargs):
+                seen["final_choose"] += 1
+                raise AssertionError("simple definition must not run final draft argmax")
+            def audit_state_lock(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "state_violation": 0.05,
+                    "unsupported_expansion": 0.05,
+                    "register_match": 0.9,
+                    "length_match": 0.9,
+                    "raw": {},
+                }
+
+        class FakeSolar:
+            def __init__(self): self.call_count = 0; self.last_render_stats = {}
+            def expand_reasoning_paths(self, *, count, generation_mode=None, **kwargs):
+                self.call_count += 1
+                seen["seed_count"] = count
+                seen["generation_mode"] = generation_mode
+                return [
+                    "garde-manger cold-kitchen section leader",
+                    "cold kitchen person in charge",
+                    "garde-manger lead",
+                ]
+            def build_state_lock(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "required_claims": ["cold-kitchen section leader"],
+                    "active_concepts": ["garde-manger", "cold kitchen", "section leader"],
+                    "optional_concepts": ["salad"],
+                    "suppressed_concepts": ["catering", "certification", "inventory"],
+                    "register": "casual_korean",
+                    "abstraction": "concrete_definition",
+                    "max_sentences": 2,
+                    "max_chars": 160,
+                    "allow_new_factual_concepts": False,
+                }
+            def render_answer_drafts(self, *, count, state_lock=None, **kwargs):
+                self.call_count += 1
+                self.render_count = count
+                self.state_lock = state_lock
+                return ["가드망 인차지는 콜드키친 파트 책임자야."]
+            def repair_state_locked_answer(self, **kwargs):
+                raise AssertionError("clean state-locked answer should not need repair")
+
+        jev = FakeJev()
+        solar = FakeSolar()
+        net = JevDecisionNetwork(config, jev, solar)
+        answer = net.run(
+            user_text="가드망 인차지가 요리업계에서 뭐냐",
+            history=[],
+            plan={"query_mode": "simple_definition"},
+            intensity="max",
+        )
+        self.assertIn("콜드키친", answer)
+        self.assertEqual(seen["seed_count"], 3)
+        self.assertEqual(seen["generation_mode"], "simple_definition")
+        self.assertEqual(jev.assert_mode, "simple_definition")
+        self.assertNotIn("VERIFY", jev.allowed)
+        self.assertEqual(solar.render_count, 1)
+        self.assertIsNotNone(solar.state_lock)
+        self.assertEqual(seen["final_choose"], 0)
+        self.assertEqual(net.last_stats["query_mode"], "simple_definition")
+
+    def test_proof_claim_audit_repairs_support_before_and_after_surface(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        audit_calls = []
+
+        class FakeJev:
+            def __init__(self): self.call_count = 0
+            def evaluate_candidate_batch(self, *, candidates, **kwargs):
+                self.call_count += 1
+                return [{"activation": 0.8, "survival": 0.8, "uncertainty": 0.2, "metrics": {}} for _ in candidates]
+            def assess_disagreement(self, **kwargs):
+                self.call_count += 1
+                return {"material_disagreement": 0.0, "needs_test": 0.0, "leader_id": "N0", "rival_id": None}
+            def search_action(self, **kwargs):
+                self.call_count += 1
+                return {"action": "STOP", "refill_count": 2, "target_span": 1, "focus_id": "POOL"}
+            def choose_blueprint(self, **kwargs):
+                self.call_count += 1
+                return 0, {"answers": {"winner": {"choice": "C0", "confidence": 0.9}}}
+            def choose_final_answer(self, **kwargs):
+                raise AssertionError("claim-audited proof should render one draft")
+
+        class FakeSolar:
+            def __init__(self): self.call_count = 0; self.last_render_stats = {}
+            def expand_reasoning_paths(self, *, count, **kwargs):
+                self.call_count += 1
+                return ["Impossible because one move flips 10 cells and rank is 7."]
+            def audit_claims(self, *, text, stage, **kwargs):
+                self.call_count += 1
+                audit_calls.append((stage, text))
+                if "10 cells" in text or "rank is 7" in text:
+                    return {
+                        "status": "FAIL",
+                        "conclusion_status": "PASS",
+                        "failed_claims": [{"claim": "false support"}],
+                        "uncertain_claims": [],
+                        "repaired_text": "Impossible. Every row has the same parity after any sequence, so a single lit cell is impossible.",
+                    }
+                if stage == "surface" and "bad rank" in text:
+                    return {
+                        "status": "FAIL",
+                        "conclusion_status": "PASS",
+                        "failed_claims": [{"claim": "bad rank"}],
+                        "uncertain_claims": [],
+                        "repaired_text": "",
+                    }
+                return {
+                    "status": "PASS",
+                    "conclusion_status": "PASS",
+                    "failed_claims": [],
+                    "uncertain_claims": [],
+                    "repaired_text": "",
+                }
+            def repair_from_claim_audit(self, *, text, **kwargs):
+                self.call_count += 1
+                if "bad rank" in text:
+                    return "Impossible. All five row parities are always equal; one lit cell would make exactly one row odd."
+                return text
+            def render_answer_drafts(self, *, chosen_blueprint, count, **kwargs):
+                self.call_count += 1
+                self.render_count = count
+                return ["Impossible, but here is a bad rank claim."]
+
+        solar = FakeSolar()
+        net = JevDecisionNetwork(config, FakeJev(), solar)
+        answer = net.run(
+            user_text="정확히 하나만 켤 수 없는지 증명하라",
+            history=[],
+            plan={"route": ["prove impossibility"], "answer_shape": "proof"},
+            intensity="fast",
+        )
+        self.assertIn("row parities", answer)
+        self.assertEqual(solar.render_count, 1)
+        self.assertTrue(any(stage == "blueprint" for stage, _ in audit_calls))
+        self.assertTrue(any(stage == "surface" for stage, _ in audit_calls))
+        self.assertTrue(net.last_stats["claim_audit_required"])
+        self.assertGreaterEqual(len(net.last_stats["claim_audits"]), 3)
 
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
