@@ -557,11 +557,13 @@ class JevDecisionNetwork:
 
             # Global loop breaker even when disagreement detection misses a conflict.
             if action == "VERIFY" and pool_already_verified:
-                if "CHALLENGE" in allowed_actions:
+                if material_conflict and "CHALLENGE" in allowed_actions:
                     action = "CHALLENGE"
-                elif "DIVERSE_REFILL" in allowed_actions:
+                elif material_conflict and "DIVERSE_REFILL" in allowed_actions:
                     action = "DIVERSE_REFILL"
                 else:
+                    # Same evidence field, no unresolved contradiction: more VERIFY
+                    # would only manufacture confidence. Collapse instead.
                     action = "STOP"
 
             decision["jev_action"] = requested_action
@@ -594,7 +596,15 @@ class JevDecisionNetwork:
                         node = by_id.get(cid)
                         if node is not None and node not in verify_nodes:
                             verify_nodes.append(node)
-                for node in parents:
+                # Also include the strongest other survivors. A bad leader/rival
+                # pairing must not hide a third hypothesis that the evidence test
+                # can rescue.
+                ranked_now = sorted(
+                    nodes,
+                    key=lambda n: (n.activation, n.survival, -n.uncertainty),
+                    reverse=True,
+                )
+                for node in [*parents, *ranked_now]:
                     if node not in verify_nodes:
                         verify_nodes.append(node)
                     if len(verify_nodes) >= 6:
