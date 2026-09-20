@@ -771,6 +771,56 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("false but polished", chosen)
         self.assertEqual(net.last_stats["evidence_tests"], 1)
 
+    def test_diversity_pressure_is_idempotent_across_rounds(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        class Dummy: pass
+        net = JevDecisionNetwork(config, Dummy(), Dummy())
+        from jevllm.jevnet import CandidateNode
+        nodes = [
+            CandidateNode(id="N0", text="same hypothesis alpha", activation=0.8),
+            CandidateNode(id="N1", text="same hypothesis alpha variant", activation=0.7),
+        ]
+        before = [n.activation for n in nodes]
+        net._diversity_adjust(nodes)
+        first_factors = [n.diversity_factor for n in nodes]
+        net._diversity_adjust(nodes)
+        second_factors = [n.diversity_factor for n in nodes]
+        self.assertEqual([n.activation for n in nodes], before)
+        self.assertEqual(first_factors, second_factors)
+
+    def test_discriminator_cannot_resolve_without_pass_fail_separation(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        replies = iter([
+            SolarResult(text='{"material_disagreement":true,"test":"check","test_kind":"DERIVATION",'
+                             '"resolved":true,"winner_id":"N0","results":['
+                             '{"candidate_id":"N0","verdict":"PASS","confidence":0.95,"evidence":"ok"},'
+                             '{"candidate_id":"N1","verdict":"UNCERTAIN","confidence":0.9,"evidence":"not checked"}]}'),
+            SolarResult(text='{"material_disagreement":true,"test":"check","test_kind":"DERIVATION",'
+                             '"resolved":true,"winner_id":"N0","results":['
+                             '{"candidate_id":"N0","verdict":"PASS","confidence":0.95,"evidence":"holds"},'
+                             '{"candidate_id":"N1","verdict":"FAIL","confidence":0.92,"evidence":"counterexample"}]}'),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        candidates = [
+            {"id": "N0", "text": "claim A"},
+            {"id": "N1", "text": "claim not-A"},
+        ]
+        first = solar.discriminate_hypotheses(
+            user_text="q", history=[], plan={}, candidates=candidates
+        )
+        second = solar.discriminate_hypotheses(
+            user_text="q", history=[], plan={}, candidates=candidates
+        )
+        self.assertFalse(first["resolved"])
+        self.assertIsNone(first["winner_id"])
+        self.assertTrue(second["resolved"])
+        self.assertEqual(second["winner_id"], "N0")
+
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
         solar = SolarClient(config)
