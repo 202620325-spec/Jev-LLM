@@ -1,4 +1,4 @@
-# JevNet -> LLM v1.3.0
+# JevNet -> LLM v1.3.1
 
 CMD chat MVP combining:
 
@@ -165,13 +165,16 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.3.0 offline status at packaging time:
+v1.3.1 offline status at patch time:
 
 - Python compile: PASS
-- unit/regression tests: **17/17 PASS**
+- unit/regression tests: **21/21 PASS**
 
 Tests cover, among other things:
 
+- malformed/non-JSON Solar candidate output is recovered without aborting JevNet.
+- repeated successful-but-empty Solar candidate completions degrade to route/survivor fallbacks instead of raising `no recoverable candidates`.
+- final-draft empty content falls back to the winning blueprint rather than crashing.
 - Jev can stop immediately even under `:max`.
 - Jev can request a refill and then stop.
 - `VERIFY` adds no Solar candidates.
