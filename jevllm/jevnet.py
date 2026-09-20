@@ -5,7 +5,9 @@ from typing import Any, Callable
 
 from .config import Config
 from .jev import JevClient
+from .routing import classify_query_mode, needs_claim_audit
 from .solar import SolarClient
+from .util import answer_confidence
 
 
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -371,6 +373,26 @@ class JevDecisionNetwork:
             "source": "none",
         }
 
+    @staticmethod
+    def _winner_confidence(raw: dict[str, Any]) -> float:
+        try:
+            return answer_confidence((raw.get("answers") or {}).get("winner", {}))
+        except Exception:
+            return 0.0
+
+    @classmethod
+    def _fallback_draft_index(cls, drafts: list[str], blueprint: str) -> int:
+        if not drafts:
+            return 0
+        bp = blueprint or ""
+        max_len = max(1, max(len(d) for d in drafts))
+        scored: list[tuple[float, int]] = []
+        for i, draft in enumerate(drafts):
+            similarity = cls._lexical_similarity(bp, draft)
+            brevity = 1.0 - min(1.0, len(draft) / max_len)
+            scored.append((0.78 * similarity + 0.22 * brevity, i))
+        return max(scored)[1]
+
     def run(
         self,
         *,
@@ -386,7 +408,25 @@ class JevDecisionNetwork:
         generated_override: int | None = None,
     ) -> str:
         self._next_node_id = 0
-        if intensity == "auto":
+        query_mode = classify_query_mode(user_text, plan)
+        claim_audit_required = needs_claim_audit(user_text, plan)
+
+        if query_mode == "simple_definition":
+            # Cheap deterministic envelope: no reason to spend a full neural search
+            # on "what is X?" after the context already identifies the domain.
+            profile = SearchProfile(
+                "simple_definition",
+                initial_seed=3,
+                max_rounds=2,
+                max_live_pool=5,
+                max_generated=6,
+                max_refill=2,
+                final_drafts=1,
+                response_length="micro",
+                reasoning_effort="low",
+            )
+            budget = {"source": "deterministic_simple_definition"}
+        elif intensity == "auto":
             budget = self.jev.network_budget(user_text=user_text, history=history, plan=plan)
             profile = self._profile_from_auto(budget, budget.get("response_length_name", "medium"))
         else:
@@ -408,7 +448,14 @@ class JevDecisionNetwork:
 
         profile.initial_seed = min(profile.initial_seed, profile.max_live_pool, profile.max_generated)
         profile.max_refill = min(profile.max_refill, profile.max_generated)
-        self.emit("network_profile", {"profile": vars(profile), "budget": budget})
+        self.emit("network_profile", {
+            "profile": vars(profile),
+            "query_mode": query_mode,
+            "claim_audit_required": claim_audit_required,
+            "budget": budget,
+            "query_mode": query_mode,
+            "claim_audit_required": claim_audit_required,
+        })
 
         initial = self.solar.expand_reasoning_paths(
             user_text=user_text,
@@ -417,6 +464,7 @@ class JevDecisionNetwork:
             count=profile.initial_seed,
             stage="adaptive seed population",
             reasoning_effort=profile.reasoning_effort,
+            generation_mode=query_mode,
         )
         nodes = self._dedupe(self._new_nodes(initial, generation=0, source="SEED"))
         if not nodes:
@@ -449,6 +497,7 @@ class JevDecisionNetwork:
                     layer_index=round_index,
                     total_layers=profile.max_rounds,
                     batch_size=self.config.jev_batch_size,
+                    evaluation_mode=query_mode,
                 )
                 self._apply_evaluations(pending, evaluations, round_index)
                 evaluated_candidates += len(pending)
@@ -461,8 +510,17 @@ class JevDecisionNetwork:
             )
             current_fingerprint = self._pool_fingerprint(ranked_for_conflict)
 
-            # Recompute disagreement only when the hypothesis texts actually change.
-            if current_fingerprint != disagreement_fingerprint:
+            # Simple definitions do not need a contradiction graph unless the
+            # router misclassified them; keep the cheap path genuinely cheap.
+            if query_mode == "simple_definition":
+                disagreement_cache = {
+                    "material_disagreement": 0.0,
+                    "needs_test": 0.0,
+                    "leader_id": ranked_for_conflict[0].id if ranked_for_conflict else None,
+                    "rival_id": None,
+                }
+                disagreement_fingerprint = current_fingerprint
+            elif current_fingerprint != disagreement_fingerprint:
                 if hasattr(self.jev, "assess_disagreement") and len(ranked_for_conflict) >= 2:
                     disagreement_cache = self.jev.assess_disagreement(
                         user_text=user_text,
@@ -513,7 +571,10 @@ class JevDecisionNetwork:
             pool_already_verified = current_fingerprint in verified_pool_fingerprints
 
             allowed_actions: list[str] = ["STOP"]
-            if rounds_left > 0:
+            if query_mode == "simple_definition":
+                if rounds_left > 0 and remaining_generated > 0:
+                    allowed_actions.append("REFILL")
+            elif rounds_left > 0:
                 allowed_actions.append("VERIFY")
                 if remaining_generated > 0:
                     allowed_actions.extend([
@@ -735,6 +796,27 @@ class JevDecisionNetwork:
                 candidates=[n.text for n in finalists],
             )
         chosen_blueprint = finalists[chosen_plan_idx].text
+
+        # Low-confidence argmax is not a hard winner. For simple definitions, fall
+        # back to the shortest near-top semantic blueprint instead of choosing a
+        # broader job-description-like candidate on a flat distribution.
+        blueprint_choice_confidence = self._winner_confidence(plan_raw)
+        if query_mode == "simple_definition" and blueprint_choice_confidence < 0.50 and finalists:
+            top_activation = max(n.activation for n in finalists)
+            viable = [
+                (i, n) for i, n in enumerate(finalists)
+                if n.activation >= top_activation - 0.08
+                and n.metrics.get("correctness", 0.0) >= 0.45
+            ]
+            if viable:
+                chosen_plan_idx, chosen_node = min(viable, key=lambda item: len(item[1].text))
+                chosen_blueprint = chosen_node.text
+                plan_raw = {
+                    **(plan_raw if isinstance(plan_raw, dict) else {}),
+                    "runtime_fallback": "low_confidence_shortest_near_top",
+                    "original_choice_confidence": blueprint_choice_confidence,
+                }
+
         self.emit("blueprint_selection", {
             "index": chosen_plan_idx,
             "blueprint": chosen_blueprint,
@@ -742,17 +824,78 @@ class JevDecisionNetwork:
             "raw": plan_raw,
         })
 
-        render_count = 1 if evidence_winners else profile.final_drafts
+        claim_audits: list[dict[str, Any]] = []
+        if claim_audit_required:
+            audit = self.solar.audit_claims(
+                user_text=user_text,
+                history=history,
+                plan=plan,
+                text=chosen_blueprint,
+                stage="blueprint",
+                verification_evidence=evidence_reports[-3:],
+            )
+            claim_audits.append({"stage": "blueprint", **audit})
+            self.emit("claim_audit", {"stage": "blueprint", "audit": audit})
+
+            if audit.get("status") != "PASS":
+                repaired = str(audit.get("repaired_text") or "").strip()
+                if not repaired:
+                    repaired = self.solar.repair_from_claim_audit(
+                        user_text=user_text,
+                        history=history,
+                        plan=plan,
+                        text=chosen_blueprint,
+                        audit=audit,
+                        verification_evidence=evidence_reports[-3:],
+                        response_length=profile.response_length,
+                    )
+                if repaired:
+                    second = self.solar.audit_claims(
+                        user_text=user_text,
+                        history=history,
+                        plan=plan,
+                        text=repaired,
+                        stage="blueprint",
+                        verification_evidence=evidence_reports[-3:],
+                    )
+                    claim_audits.append({"stage": "blueprint_recheck", **second})
+                    self.emit("claim_audit", {"stage": "blueprint_recheck", "audit": second})
+                    chosen_blueprint = repaired
+                    if second.get("status") != "PASS":
+                        chosen_blueprint = self.solar.repair_from_claim_audit(
+                            user_text=user_text,
+                            history=history,
+                            plan=plan,
+                            text=repaired,
+                            audit=second,
+                            verification_evidence=evidence_reports[-3:],
+                            response_length=profile.response_length,
+                        )
+
+        state_lock: dict[str, Any] | None = None
+        if query_mode == "simple_definition":
+            state_lock = self.solar.build_state_lock(
+                user_text=user_text,
+                history=history,
+                plan=plan,
+                chosen_blueprint=chosen_blueprint,
+                verification_evidence=evidence_reports[-2:],
+                query_mode=query_mode,
+            )
+            self.emit("state_lock", {"state": state_lock})
+
+        render_count = 1 if (evidence_winners or claim_audit_required or state_lock) else profile.final_drafts
         drafts = self.solar.render_answer_drafts(
             user_text=user_text,
             history=history,
             plan=plan,
             chosen_blueprint=chosen_blueprint,
-            supporting_blueprints=[n.text for n in finalists[:5]],
+            supporting_blueprints=[] if state_lock else [n.text for n in finalists[:5]],
             count=render_count,
             response_length=profile.response_length,
             reasoning_effort=profile.reasoning_effort,
             verification_evidence=evidence_reports[-3:],
+            state_lock=state_lock,
         )
         if not drafts:
             raise RuntimeError("Solar produced zero final answer drafts")
@@ -769,7 +912,85 @@ class JevDecisionNetwork:
                 plan=plan,
                 drafts=drafts,
             )
+            final_confidence = self._winner_confidence(final_raw)
+            if final_confidence < 0.50:
+                original_selected = selected
+                selected = self._fallback_draft_index(drafts, chosen_blueprint)
+                final_raw = {
+                    **(final_raw if isinstance(final_raw, dict) else {}),
+                    "runtime_fallback": "low_confidence_blueprint_alignment",
+                    "original_selected": original_selected,
+                    "original_choice_confidence": final_confidence,
+                }
+
         answer = drafts[selected]
+
+        state_conformance: dict[str, Any] | None = None
+        if state_lock and hasattr(self.jev, "audit_state_lock"):
+            state_conformance = self.jev.audit_state_lock(
+                user_text=user_text,
+                state_lock=state_lock,
+                answer=answer,
+            )
+            self.emit("state_conformance", {"audit": state_conformance})
+            if (
+                float(state_conformance.get("state_violation", 0.0)) >= 0.35
+                or float(state_conformance.get("unsupported_expansion", 0.0)) >= 0.35
+                or float(state_conformance.get("register_match", 1.0)) < 0.50
+                or float(state_conformance.get("length_match", 1.0)) < 0.50
+            ):
+                repaired = self.solar.repair_state_locked_answer(
+                    user_text=user_text,
+                    history=history,
+                    state_lock=state_lock,
+                    answer=answer,
+                    audit=state_conformance,
+                )
+                if repaired:
+                    answer = repaired
+                    state_conformance = self.jev.audit_state_lock(
+                        user_text=user_text,
+                        state_lock=state_lock,
+                        answer=answer,
+                    )
+                    self.emit("state_conformance", {"audit": state_conformance, "recheck": True})
+
+        if claim_audit_required:
+            surface_audit = self.solar.audit_claims(
+                user_text=user_text,
+                history=history,
+                plan=plan,
+                text=answer,
+                stage="surface",
+                verification_evidence=evidence_reports[-3:],
+            )
+            claim_audits.append({"stage": "surface", **surface_audit})
+            self.emit("claim_audit", {"stage": "surface", "audit": surface_audit})
+            if surface_audit.get("status") != "PASS":
+                repaired_answer = self.solar.repair_from_claim_audit(
+                    user_text=user_text,
+                    history=history,
+                    plan=plan,
+                    text=answer,
+                    audit=surface_audit,
+                    verification_evidence=evidence_reports[-3:],
+                    response_length=profile.response_length,
+                )
+                if repaired_answer:
+                    recheck = self.solar.audit_claims(
+                        user_text=user_text,
+                        history=history,
+                        plan=plan,
+                        text=repaired_answer,
+                        stage="surface",
+                        verification_evidence=evidence_reports[-3:],
+                    )
+                    claim_audits.append({"stage": "surface_recheck", **recheck})
+                    self.emit("claim_audit", {"stage": "surface_recheck", "audit": recheck})
+                    answer = repaired_answer if recheck.get("status") == "PASS" else (
+                        str(recheck.get("repaired_text") or "").strip() or repaired_answer
+                    )
+
         self.emit("final_selection", {"index": selected, "raw": final_raw, "answer": answer})
 
         self.last_stats = {
@@ -788,6 +1009,9 @@ class JevDecisionNetwork:
             "disagreement_checks": disagreement_checks,
             "evidence_tests": len(evidence_reports),
             "evidence_reports": evidence_reports,
+            "claim_audits": claim_audits,
+            "state_lock": state_lock,
+            "state_conformance": state_conformance,
             "solar_calls": self.solar.call_count,
             "jev_calls": self.jev.call_count,
         }
