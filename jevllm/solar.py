@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import requests
@@ -749,11 +750,10 @@ class SolarClient:
             return f"generation stopped by {finish_reason}"
 
         compact = " ".join(value.split())
-        route = plan.get("route") or []
         required = plan.get("required_points") or []
+        answer_shape = str(plan.get("answer_shape") or "")
         complex_request = (
-            len(route) >= 2
-            or bool(required)
+            len(required) >= 2
             or bool(re.search(
                 r"\b(prove|proof|minimal|minimality|construction|construct|derive|explain|justify|counterexample)\b",
                 user_text,
