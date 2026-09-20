@@ -14,7 +14,7 @@ from jevllm.solar import SolarError
 
 BANNER = r"""
 ======================================================================
- JEVNET -> LLM v1.3 | Adaptive Jev search over Solar proposal space
+ JEVNET -> LLM v1.4 | Evidence-gated Jev search over Solar proposal space
 ======================================================================
  Jev decides: STOP / REFILL / DIVERSE / DEEPEN / MUTATE / MERGE /
               CHALLENGE / VERIFY
@@ -71,8 +71,22 @@ def make_event_sink(state: dict[str, bool]):
             )
             return
 
+        if event == "disagreement" and state["trace"]:
+            a = data.get("assessment", {})
+            print(
+                f"[Disagreement R{data['round']}] material={a.get('material_disagreement', 0.0):.2f} "
+                f"needs_test={a.get('needs_test', 0.0):.2f} "
+                f"leader={a.get('leader_id')} rival={a.get('rival_id')}"
+            )
+            return
+
         if event == "verification" and state["trace"]:
-            print(f"[VERIFY] re-checked {len(data.get('nodes', []))} candidates")
+            report = data.get("report") or {}
+            print(
+                f"[VERIFY evidence R{data['round']}] kind={report.get('test_kind')} "
+                f"resolved={report.get('resolved')} winner={report.get('winner_id')} "
+                f"| {report.get('test', '')}"
+            )
             return
 
         if event == "surface_render" and state["trace"]:
@@ -106,8 +120,10 @@ def make_event_sink(state: dict[str, bool]):
             print(f"[{data['action']}] generated {len(data.get('children', []))}")
             for n in data.get("children", []):
                 print(f"  + {n['id']} [{n['source']}]: {n['text']}")
+        elif event == "disagreement":
+            print("[Disagreement]", json.dumps(data.get("assessment", {}), ensure_ascii=False, indent=2))
         elif event == "verification":
-            print("[VERIFY result]")
+            print("[VERIFY evidence]", json.dumps(data.get("report", {}), ensure_ascii=False, indent=2))
             for n in data.get("nodes", []):
                 print(
                     f"  {n['id']} act={n['activation']:.3f} survive={n['survival']:.3f} "
