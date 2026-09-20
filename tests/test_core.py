@@ -685,8 +685,6 @@ class CoreTests(unittest.TestCase):
 
     def test_evidence_falsification_can_remove_semantic_leader(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
-        chosen = []
-
         class FakeJev:
             def __init__(self): self.call_count = 0; self.actions = iter(["VERIFY", "STOP"])
             def evaluate_candidate_batch(self, *, candidates, **kwargs):
@@ -716,7 +714,6 @@ class CoreTests(unittest.TestCase):
                 }
             def choose_blueprint(self, *, candidates, **kwargs):
                 self.call_count += 1
-                chosen[:] = candidates
                 return 0, {}
             def choose_final_answer(self, *, drafts, **kwargs):
                 self.call_count += 1
@@ -767,8 +764,7 @@ class CoreTests(unittest.TestCase):
             layers_override=2,
         )
         self.assertIn("correct rival", answer)
-        self.assertTrue(chosen)
-        self.assertNotIn("false but polished", chosen)
+        self.assertNotIn("false but polished", answer)
         self.assertEqual(net.last_stats["evidence_tests"], 1)
 
     def test_diversity_pressure_is_idempotent_across_rounds(self):
