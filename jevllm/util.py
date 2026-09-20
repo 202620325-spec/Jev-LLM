@@ -85,6 +85,7 @@ def recover_candidate_strings(text: str, limit: int) -> list[str]:
     if cleaned:
         return cleaned[:limit]
 
+    # Recover common malformed JSON object snippets.
     for match in re.finditer(r'"(?:text|content|candidate|continuation)"\s*:\s*"((?:\\.|[^"\\])*)"', raw, flags=re.I):
         try:
             value = json.loads('"' + match.group(1) + '"').strip()
@@ -95,6 +96,7 @@ def recover_candidate_strings(text: str, limit: int) -> list[str]:
         if len(cleaned) >= limit:
             return cleaned
 
+    # Recover C0:, 1., -, * labelled candidates.
     for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("```"):
@@ -126,6 +128,7 @@ def normalize_probability_map(answer: dict[str, Any]) -> dict[str, float]:
 
 
 def score_level(answer: dict[str, Any], level_count: int) -> int:
+    """Use the most-probable Jev score level. Do not round expected score unless probabilities are absent."""
     probs = normalize_probability_map(answer)
     numeric: list[tuple[int, float]] = []
     for key, probability in probs.items():
@@ -153,6 +156,7 @@ def answer_confidence(answer: dict[str, Any]) -> float:
 
 
 def score_expectation(answer: dict[str, Any], level_count: int = 6) -> float:
+    """Return normalized expected Jev score in [0,1]. Falls back to raw score."""
     probs = normalize_probability_map(answer)
     weighted = 0.0
     total = 0.0
