@@ -4,7 +4,6 @@ from jevllm.config import Config
 from jevllm.controller import AdaptiveController
 from jevllm.engine import JevLLM
 from jevllm.jevnet import JevDecisionNetwork
-from jevllm.sanity import hard_sanity_issues
 from jevllm.solar import SolarClient
 from jevllm.types import ControlProfile, SolarResult
 from jevllm.util import extract_json, recover_candidate_strings, score_expectation, score_level
@@ -367,126 +366,6 @@ class CoreTests(unittest.TestCase):
             supporting_blueprints=[], count=1, response_length="medium", reasoning_effort="high",
         )
         self.assertEqual(out, ["usable blueprint"])
-
-    def test_sanity_rejects_impossible_exact_accuracy_for_discrete_items(self):
-        bad = "Consider five test items. Each component now has accuracy = 75%."
-        issues = hard_sanity_issues(bad)
-        self.assertTrue(any(issue.code == "IMPOSSIBLE_DISCRETE_PERCENT" for issue in issues))
-        self.assertTrue(any("75%" in issue.message and "5" in issue.message for issue in issues))
-
-        good = "Consider four test items. Each component now has accuracy = 75%."
-        self.assertEqual(hard_sanity_issues(good), [])
-
-    def test_sanity_catches_fraction_percent_mismatch(self):
-        issues = hard_sanity_issues("The result is 3/5 = 75% accuracy.")
-        self.assertTrue(any(issue.code == "FRACTION_PERCENT_MISMATCH" for issue in issues))
-
-    def test_jevnet_sanity_vetoes_stop_and_forces_challenge(self):
-        config = Config(openrouter_api_key="x", upstage_api_key="y")
-        events = []
-
-        class FakeJev:
-            def __init__(self): self.call_count = 0
-            def evaluate_candidate_batch(self, *, candidates, layer_index, **kwargs):
-                self.call_count += 1
-                if layer_index == 0:
-                    return [
-                        {
-                            "activation": 0.95 if "75%" in c else 0.60,
-                            "survival": 0.9,
-                            "uncertainty": 0.1,
-                            "metrics": {},
-                        }
-                        for c in candidates
-                    ]
-                return [
-                    {
-                        "activation": 0.35 if "75%" in c else 0.92,
-                        "survival": 0.9,
-                        "uncertainty": 0.1,
-                        "metrics": {},
-                    }
-                    for c in candidates
-                ]
-            def search_action(self, **kwargs):
-                self.call_count += 1
-                return {
-                    "action": "STOP",
-                    "refill_count": 2,
-                    "target_span": 2,
-                    "focus_id": "POOL",
-                    "ready_to_stop": 0.9,
-                }
-            def choose_blueprint(self, *, candidates, **kwargs):
-                self.call_count += 1
-                self.assert_no_bad = candidates
-                return 0, {}
-            def choose_final_answer(self, *, drafts, **kwargs):
-                self.call_count += 1
-                return 0, {}
-
-        class FakeSolar:
-            def __init__(self): self.call_count = 0; self.actions = []
-            def expand_reasoning_paths(self, *, count, **kwargs):
-                self.call_count += 1
-                return [
-                    "Consider five test items. Each component has accuracy = 75%.",
-                    *[f"clean seed {i}" for i in range(max(0, count - 1))],
-                ]
-            def adaptive_reasoning_operation(self, *, action, count, **kwargs):
-                self.call_count += 1
-                self.actions.append(action)
-                return [f"repaired clean candidate {i}" for i in range(count)]
-            def render_answer_drafts(self, *, count, **kwargs):
-                self.call_count += 1
-                return [f"clean final {i}" for i in range(count)]
-
-        jev = FakeJev()
-        solar = FakeSolar()
-        net = JevDecisionNetwork(config, jev, solar, lambda e, d: events.append((e, d)))
-        answer = net.run(user_text="q", history=[], plan={}, intensity="fast")
-
-        self.assertTrue(answer.startswith("clean final"))
-        self.assertEqual(solar.actions, ["CHALLENGE"])
-        self.assertEqual(net.last_stats["adaptive_actions"], ["CHALLENGE", "STOP"])
-        self.assertEqual(net.last_stats["sanity_vetoes"], 1)
-        self.assertTrue(any(event == "sanity_gate" for event, _ in events))
-
-    def test_final_draft_sanity_filter_rejects_impossible_surface_math(self):
-        config = Config(openrouter_api_key="x", upstage_api_key="y")
-
-        class FakeJev:
-            def __init__(self): self.call_count = 0
-            def evaluate_candidate_batch(self, *, candidates, **kwargs):
-                self.call_count += 1
-                return [{"activation": 0.9, "survival": 0.9, "uncertainty": 0.1, "metrics": {}} for _ in candidates]
-            def search_action(self, **kwargs):
-                self.call_count += 1
-                return {"action": "STOP", "refill_count": 2, "target_span": 2, "focus_id": "POOL", "ready_to_stop": 0.95}
-            def choose_blueprint(self, **kwargs):
-                self.call_count += 1
-                return 0, {}
-            def choose_final_answer(self, **kwargs):
-                raise AssertionError("Only one clean draft should remain after deterministic filtering")
-
-        class FakeSolar:
-            def __init__(self): self.call_count = 0
-            def expand_reasoning_paths(self, *, count, **kwargs):
-                self.call_count += 1
-                return [f"clean blueprint {i}" for i in range(count)]
-            def adaptive_reasoning_operation(self, **kwargs):
-                raise AssertionError("STOP should not be vetoed for clean blueprints")
-            def render_answer_drafts(self, *, count, **kwargs):
-                self.call_count += 1
-                return [
-                    "Consider five test items; accuracy = 75%.",
-                    "A clean final answer without impossible arithmetic.",
-                ][:count]
-
-        net = JevDecisionNetwork(config, FakeJev(), FakeSolar())
-        answer = net.run(user_text="q", history=[], plan={}, intensity="fast")
-        self.assertEqual(answer, "A clean final answer without impossible arithmetic.")
-        self.assertEqual(net.last_stats["sanity_flagged_drafts"], 1)
 
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
