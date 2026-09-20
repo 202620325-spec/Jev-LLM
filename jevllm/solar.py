@@ -18,6 +18,7 @@ class SolarClient:
     def __init__(self, config: Config):
         self.config = config
         self.call_count = 0
+        self.last_render_stats: dict[str, Any] = {}
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -644,6 +645,189 @@ class SolarClient:
             return [survivor]
         return [self._route_fallback_blueprint(user_text, plan, f"adaptive {action}")]
 
+    @staticmethod
+    def _finish_reason(result: SolarResult) -> str | None:
+        raw = result.raw if isinstance(result.raw, dict) else {}
+        try:
+            value = raw["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return None
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _dedupe_final_drafts(items: list[str], limit: int) -> list[str]:
+        """Deduplicate complete final answers without flattening Markdown/newlines."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            value = (item or "").strip()
+            if not value:
+                continue
+            key = " ".join(value.casefold().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(value)
+            if len(out) >= limit:
+                break
+        return out
+
+    @classmethod
+    def _recover_final_drafts(cls, text: str, limit: int) -> tuple[list[str], str]:
+        """Recover whole final answers, never bullet/heading fragments."""
+        raw = (text or "").strip()
+        if not raw:
+            return [], "empty"
+
+        parsed: Any = None
+        try:
+            parsed = extract_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+
+        def item_text(item: Any) -> str | None:
+            if isinstance(item, str):
+                return item.strip() or None
+            if isinstance(item, dict):
+                for key in ("text", "content", "answer", "draft", "candidate"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+            return None
+
+        pool: list[Any] = []
+        if isinstance(parsed, dict):
+            for key in ("candidates", "drafts", "answers", "options", "choices"):
+                value = parsed.get(key)
+                if isinstance(value, list):
+                    pool.extend(value)
+                    break
+                if isinstance(value, str):
+                    pool.append(value)
+                    break
+            if not pool:
+                maybe = item_text(parsed)
+                if maybe:
+                    pool.append(maybe)
+        elif isinstance(parsed, list):
+            pool.extend(parsed)
+        elif isinstance(parsed, str):
+            pool.append(parsed)
+
+        values: list[str] = []
+        for item in pool:
+            value = item_text(item)
+            if value:
+                values.append(value)
+        structured = cls._dedupe_final_drafts(values, limit)
+        if structured:
+            return structured, "structured"
+
+        stripped = raw.lstrip()
+        if (
+            stripped.startswith("{")
+            or stripped.startswith("[")
+            or stripped.lower().startswith(chr(96) * 3 + "json")
+        ):
+            return [], "malformed_structured"
+
+        # Unlike blueprint recovery, Markdown prose is one complete draft.
+        return [raw], "raw_prose"
+
+    @staticmethod
+    def _surface_answer_problem(
+        text: str,
+        *,
+        user_text: str,
+        plan: dict[str, Any],
+        finish_reason: str | None = None,
+    ) -> str | None:
+        value = (text or "").strip()
+        if not value:
+            return "empty final answer"
+        if finish_reason and finish_reason.lower() in {"length", "max_tokens", "max_output_tokens"}:
+            return f"generation stopped by {finish_reason}"
+
+        compact = " ".join(value.split())
+        route = plan.get("route") or []
+        required = plan.get("required_points") or []
+        complex_request = (
+            len(route) >= 2
+            or bool(required)
+            or bool(re.search(
+                r"\b(prove|proof|minimal|minimality|construction|construct|derive|explain|justify|counterexample)\b",
+                user_text,
+                flags=re.I,
+            ))
+        )
+
+        if complex_request and len(compact) <= 96:
+            return "final answer is too short for the requested multi-part reasoning task"
+        if len(compact) <= 120 and compact.count("**") % 2 == 1:
+            return "unbalanced Markdown in a short final fragment"
+        if compact.count(chr(96) * 3) % 2 == 1:
+            return "unclosed fenced code block"
+        return None
+
+    def _repair_final_surface(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        chosen_blueprint: str,
+        supporting_blueprints: list[str],
+        broken_output: str,
+        reason: str,
+        ceiling: int,
+    ) -> str | None:
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-8:],
+            "route": plan,
+            "winning_blueprint": chosen_blueprint,
+            "supporting_survivors": supporting_blueprints,
+            "broken_or_incomplete_output": broken_output[-5000:],
+            "repair_reason": reason,
+            "requirements": [
+                "Return ONE complete user-facing answer as plain text/Markdown, not JSON.",
+                "Answer every explicitly requested part.",
+                "Do not return only a heading, label, outline fragment, or sentence stub.",
+                "Preserve the winning blueprint semantics; repair surface completeness/formatting.",
+                "Do not mention this repair process or internal candidates.",
+            ],
+        }
+        for effort, max_tokens in [
+            ("medium", max(2048, ceiling * 2)),
+            ("low", max(3072, ceiling * 2)),
+        ]:
+            result = self.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Repair the incomplete final response. Return exactly one complete "
+                            "user-facing answer. No JSON wrapper and no preface."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                reasoning_effort=effort,
+                max_tokens=max_tokens,
+            )
+            candidate = (result.text or "").strip()
+            problem = self._surface_answer_problem(
+                candidate,
+                user_text=user_text,
+                plan=plan,
+                finish_reason=self._finish_reason(result),
+            )
+            if candidate and problem is None:
+                return candidate
+            payload["broken_or_incomplete_output"] = candidate[-5000:]
+            payload["repair_reason"] = problem or reason
+        return None
+
     def render_answer_drafts(
         self,
         *,
@@ -657,7 +841,10 @@ class SolarClient:
         reasoning_effort: str,
     ) -> list[str]:
         count = max(1, min(6, count))
-        length_data = next(((target, ceiling, desc) for name, target, ceiling, desc in RESPONSE_LENGTHS if name == response_length), (550, 1400, "normal complete answer"))
+        length_data = next(
+            ((target, ceiling, desc) for name, target, ceiling, desc in RESPONSE_LENGTHS if name == response_length),
+            (550, 1400, "normal complete answer"),
+        )
         target, ceiling, desc = length_data
         payload = {
             "user_request": user_text,
@@ -672,44 +859,120 @@ class SolarClient:
                 "Preserve the semantic strengths of the winning blueprint.",
                 "Use supporting survivors only when they improve correctness or completeness.",
                 "Do not mention the internal network, candidates, scores, or hidden reasoning unless asked.",
-                "Drafts should be independently phrased but semantically strong, not cosmetic paraphrases.",
+                "Each draft must independently answer the whole request.",
             ],
         }
+
         if count == 1:
-            text = self.chat(
+            result = self.chat(
                 [
-                    {"role": "system", "content": "Render the selected blueprint into the best final user-facing answer. Return only the answer."},
+                    {
+                        "role": "system",
+                        "content": "Render the selected blueprint into the best complete final user-facing answer. Return only the answer.",
+                    },
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 reasoning_effort=reasoning_effort,
                 max_tokens=ceiling,
-            ).text.strip()
-            return [text] if text else [chosen_blueprint]
+            )
+            text = (result.text or "").strip()
+            problem = self._surface_answer_problem(
+                text,
+                user_text=user_text,
+                plan=plan,
+                finish_reason=self._finish_reason(result),
+            )
+            if text and problem is None:
+                self.last_render_stats = {
+                    "mode": "single", "protocol": "plain", "repaired": False, "drafts": 1
+                }
+                return [text]
+
+            repaired = self._repair_final_surface(
+                user_text=user_text,
+                history=history,
+                plan=plan,
+                chosen_blueprint=chosen_blueprint,
+                supporting_blueprints=supporting_blueprints,
+                broken_output=text,
+                reason=problem or "empty final surface",
+                ceiling=ceiling,
+            )
+            self.last_render_stats = {
+                "mode": "single",
+                "protocol": "plain",
+                "repaired": bool(repaired),
+                "drafts": 1 if repaired else 0,
+                "problem": problem,
+            }
+            return [repaired or chosen_blueprint]
 
         result = self.chat(
             [
-                {"role": "system", "content": "Render multiple strong final answers. Return strict JSON {\"candidates\":[\"full answer\", ...]}."},
+                {
+                    "role": "system",
+                    "content": (
+                        "Render multiple strong COMPLETE final answers. "
+                        "Return strict JSON with a candidates array of full answers. "
+                        "Each candidate must independently answer the whole user request. "
+                        "Never put headings or bullet fragments in the candidates array."
+                    ),
+                },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             reasoning_effort=reasoning_effort,
-            max_tokens=min(8000, ceiling * count),
+            max_tokens=min(10000, max(4096, ceiling * count)),
         )
-        drafts = self._recover_blueprints_lenient(result.text, count)
-        if drafts:
-            return drafts[:count]
-        fallback = self.chat(
-            [
-                {"role": "system", "content": "Render the selected blueprint into the best final user-facing answer. Return only the answer."},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            reasoning_effort=reasoning_effort,
-            max_tokens=ceiling,
-        ).text.strip()
-        if fallback:
-            return [fallback]
-        # A successful-but-empty surface render should not erase a valid winning
-        # blueprint. It is less polished, but remains a usable final fallback.
-        return [chosen_blueprint]
+        finish_reason = self._finish_reason(result)
+        drafts, protocol = self._recover_final_drafts(result.text, count)
+
+        valid: list[str] = []
+        rejected: list[dict[str, str]] = []
+        for draft in drafts:
+            problem = self._surface_answer_problem(
+                draft,
+                user_text=user_text,
+                plan=plan,
+                finish_reason=finish_reason,
+            )
+            if problem is None:
+                valid.append(draft)
+            else:
+                rejected.append({"problem": problem, "preview": draft[:180]})
+
+        if valid:
+            self.last_render_stats = {
+                "mode": "multi",
+                "protocol": protocol,
+                "repaired": False,
+                "drafts": len(valid),
+                "rejected": len(rejected),
+                "finish_reason": finish_reason,
+            }
+            return self._dedupe_final_drafts(valid, count)
+
+        broken = (result.text or "").strip()
+        reason = rejected[0]["problem"] if rejected else f"malformed final-draft protocol ({protocol})"
+        repaired = self._repair_final_surface(
+            user_text=user_text,
+            history=history,
+            plan=plan,
+            chosen_blueprint=chosen_blueprint,
+            supporting_blueprints=supporting_blueprints,
+            broken_output=broken,
+            reason=reason,
+            ceiling=ceiling,
+        )
+        self.last_render_stats = {
+            "mode": "multi",
+            "protocol": protocol,
+            "repaired": bool(repaired),
+            "drafts": 1 if repaired else 0,
+            "rejected": len(rejected),
+            "finish_reason": finish_reason,
+            "problem": reason,
+        }
+        return [repaired or chosen_blueprint]
 
     def direct_answer(self, *, user_text: str, history: list[dict[str, str]], reasoning_effort: str = "high", response_length: str = "medium") -> str:
         """Solar-only baseline with empty-surface recovery.
