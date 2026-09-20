@@ -177,7 +177,8 @@ Generate hypotheses
        - use an external deterministic verifier when one is attached
   -> FAIL evidence can eliminate a high-scoring hypothesis
   -> unresolved same-pool VERIFY cannot repeat
-  -> CHALLENGE / DIVERSE instead
+  -> REVIVE: hide the current pool and generate clean-room hypotheses
+  -> CHALLENGE / DIVERSE when targeted adversarial search is still useful
   -> COLLAPSE only after disagreement is resolved or no material conflict remains
 ```
 
@@ -185,6 +186,7 @@ Important implementation changes:
 
 - unchanged candidates are not fully re-scored by Jev every round;
 - one unchanged pool can be VERIFY'd only once;
+- unresolved verification triggers clean-room REVIVE so a dominant framing cannot keep feeding itself;
 - Jev detects disagreement but does not certify truth;
 - Solar performs the default evidence-producing verification;
 - `JevDecisionNetwork(..., verifier=...)` accepts an external deterministic verifier hook, intended for environments such as JevCoder where compile/test/typecheck/runtime checks are available;
