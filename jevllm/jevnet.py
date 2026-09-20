@@ -450,8 +450,6 @@ class JevDecisionNetwork:
         profile.max_refill = min(profile.max_refill, profile.max_generated)
         self.emit("network_profile", {
             "profile": vars(profile),
-            "query_mode": query_mode,
-            "claim_audit_required": claim_audit_required,
             "budget": budget,
             "query_mode": query_mode,
             "claim_audit_required": claim_audit_required,
@@ -995,6 +993,8 @@ class JevDecisionNetwork:
 
         self.last_stats = {
             "profile": vars(profile),
+            "query_mode": query_mode,
+            "claim_audit_required": claim_audit_required,
             "seed_candidates": len(initial),
             "total_generated_candidates": generated_total,
             "live_pool_at_finish": len(nodes),
