@@ -301,17 +301,27 @@ def main() -> int:
             original_history = list(engine.history)
             try:
                 base_start = engine.solar.call_count
-                baseline = engine.solar.direct_answer(
-                    user_text=arg,
-                    history=original_history,
-                    reasoning_effort="high",
-                    response_length="medium",
-                )
+                baseline_error = None
+                try:
+                    baseline = engine.solar.direct_answer(
+                        user_text=arg,
+                        history=original_history,
+                        reasoning_effort="high",
+                        response_length="medium",
+                    )
+                except SolarError as exc:
+                    baseline_error = str(exc)
+                    baseline = f"[Solar baseline unavailable: {baseline_error}]"
                 base_calls = engine.solar.call_count - base_start
+
+                # A baseline transport/surface failure must not cancel the JevNet
+                # half of the controlled comparison.
                 engine.history = list(original_history)
                 engine.pipeline_mode = "net"
                 net_answer = engine.answer(arg)
                 print(f"\n--- SOLAR BASELINE ({base_calls} Solar call) ---\n{baseline}")
+                if baseline_error:
+                    print(f"[baseline recovery exhausted] {baseline_error}")
                 print(f"\n--- JEVNET ADAPTIVE ---\n{net_answer}")
                 print("\n[JevNet stats]", json.dumps(engine.last_stats, ensure_ascii=False))
             except (JevError, SolarError, ValueError, RuntimeError) as exc:
