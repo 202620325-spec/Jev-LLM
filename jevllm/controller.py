@@ -83,6 +83,8 @@ class AdaptiveController:
                 old = getattr(self.state, key)
                 setattr(self.state, key, self.momentum * old + (1.0 - self.momentum) * value)
 
+        # Cross-coupling: difficult/global/uncertain states activate deeper search,
+        # while uncertain states make the linguistic horizon slightly more local.
         mode_signal = _clip(self.state.mode + 0.12 * self.state.scope + 0.10 * uncertainty)
         breadth_signal = _clip(self.state.breadth + 0.16 * uncertainty + 0.10 * mode_signal)
         scope_signal = _clip(self.state.scope + 0.08 * mode_signal)
@@ -98,10 +100,12 @@ class AdaptiveController:
         mode = COGNITIVE_MODES[mode_idx]
         breadth = BREADTH_LEVELS[breadth_level_idx]
 
+        # Cognitive mode imposes a sensible search-width envelope.
         minimums = {"predict": 1, "options": 2, "reason_low": 2, "reason_medium": 3, "reason_high": 4, "reason_extreme": 5}
         maximums = {"predict": 1, "options": 4, "reason_low": 3, "reason_medium": 4, "reason_high": 5, "reason_extreme": 6}
         breadth = max(minimums[mode], min(breadth, maximums[mode]))
 
+        # A scalar execution budget controls how long the recurrent decode should stay active.
         deliberation = _clip(
             0.34 * mode_signal
             + 0.24 * scope_signal
@@ -118,6 +122,7 @@ class AdaptiveController:
             base = self.full_base_steps
         desired_steps = min(cap, max(1, round(base + deliberation * max(0, cap - base))))
 
+        # Deep reasoning requires stronger readiness before yielding to the surface generator.
         finalize_threshold = _clip(0.58 + 0.24 * deliberation, 0.58, 0.86)
 
         length_name, target_tokens, max_tokens, _ = RESPONSE_LENGTHS[length_idx]
