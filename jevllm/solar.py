@@ -517,6 +517,7 @@ class SolarClient:
         count: int,
         stage: str,
         reasoning_effort: str = "high",
+        generation_mode: str = "normal",
     ) -> list[str]:
         """Generate compact answer blueprints without format-fragile failure.
 
@@ -525,35 +526,57 @@ class SolarClient:
         to the already-computed route instead of aborting JevNet.
         """
         count = max(1, min(32, count))
+        simple_definition = generation_mode == "simple_definition"
+        if simple_definition:
+            requirements = [
+                "Generate only conventional, directly relevant meanings of the term in the user's stated context.",
+                "Do not invent speculative alternate senses, certifications, brands, incidents, organizations, or unrelated domain interpretations.",
+                "Each candidate must be a compact semantic definition, not a job description or encyclopedia expansion.",
+                "A candidate may add at most one nearby clarifying example when it materially helps identify the meaning.",
+                "Prefer semantic precision over diversity. If three genuinely different grounded meanings do not exist, return fewer candidates.",
+                "Do not reveal private chain-of-thought.",
+            ]
+            system = (
+                "You generate compact grounded definition blueprints. Stay inside the user's local semantic context. "
+                "Never manufacture diversity. Return strict JSON {\"candidates\":[\"...\"]}."
+            )
+            max_tokens = min(1800, max(900, 420 + count * 260))
+            effective_effort = "low"
+        else:
+            requirements = [
+                "Generate materially different answer blueprints/solution approaches.",
+                "Each candidate must be self-contained enough for a decision model to judge.",
+                "Use concise claims, steps, assumptions, or answer structure; do not reveal private chain-of-thought.",
+                "Include alternative interpretations only when ambiguity is material and grounded in the request.",
+                "Do not optimize wording; optimize semantic diversity and correctness potential.",
+            ]
+            system = (
+                "You are the proposal population generator inside an inference-time decision network. "
+                "Return strict JSON {\"candidates\":[\"...\"]}. Generate distinct compact answer blueprints, not final prose and not chain-of-thought."
+            )
+            max_tokens = min(10000, max(4096, 1400 + count * 360))
+            effective_effort = reasoning_effort
+
         payload = {
             "user_request": user_text,
             "recent_conversation": history[-8:],
             "route": plan,
             "stage": stage,
+            "generation_mode": generation_mode,
             "candidate_count": count,
-            "requirements": [
-                "Generate materially different answer blueprints/solution approaches.",
-                "Each candidate must be self-contained enough for a decision model to judge.",
-                "Use concise claims, steps, assumptions, or answer structure; do not reveal private chain-of-thought.",
-                "Include alternative interpretations when ambiguity is material.",
-                "Do not optimize wording; optimize semantic diversity and correctness potential.",
-            ],
+            "requirements": requirements,
         }
-        system = (
-            "You are the proposal population generator inside an inference-time decision network. "
-            "Return strict JSON {\"candidates\":[\"...\"]}. Generate distinct compact answer blueprints, not final prose and not chain-of-thought."
-        )
 
         result = self.chat(
             [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-            reasoning_effort=reasoning_effort,
-            max_tokens=min(10000, max(4096, 1400 + count * 360)),
+            reasoning_effort=effective_effort,
+            max_tokens=max_tokens,
         )
         out = self._recover_blueprints_lenient(result.text, count)
 
         # Second pass deliberately changes the output protocol. If JSON is what
         # caused the failure, repeating the same JSON request is not a real repair.
-        if len(out) < max(2, count // 2):
+        if len(out) < max(2, count // 2) and not simple_definition:
             missing = count - len(out)
             repair_payload = {**payload, "candidate_count": missing, "avoid_duplicates_of": out}
             repair = self.chat(
@@ -574,7 +597,7 @@ class SolarClient:
 
         # Plain-text single-candidate repairs remove all list/wrapper parsing from
         # the equation. Cap retries so robustness does not become an infinite loop.
-        repair_attempts = min(3, max(0, count - len(out)))
+        repair_attempts = 0 if simple_definition and out else min(3, max(0, count - len(out)))
         for attempt in range(repair_attempts):
             candidate = self._repair_blueprint_plain(
                 user_text=user_text,
@@ -892,6 +915,167 @@ class SolarClient:
         return [self._route_fallback_blueprint(user_text, plan, f"adaptive {action}")]
 
     @staticmethod
+    def _infer_register(user_text: str, plan: dict[str, Any]) -> str:
+        text = (user_text or "").strip()
+        language = str(plan.get("language") or "").lower()
+        if re.search(r"(뭐냐|뭐임|뭔데|뭐야|ㅋㅋ|야\??$)", text):
+            return "casual_korean"
+        if re.search(r"(무엇인가요|뭔가요|알려주세요|설명해주세요|요\??$)", text):
+            return "polite_korean"
+        if "korean" in language or "ko" == language:
+            return "neutral_korean"
+        return "natural_user_register"
+
+    @staticmethod
+    def _clean_state_list(value: Any, limit: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            text = " ".join(str(item or "").strip().split())
+            key = text.casefold()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _sanitize_state_lock(
+        self,
+        raw: dict[str, Any],
+        *,
+        user_text: str,
+        plan: dict[str, Any],
+        chosen_blueprint: str,
+        query_mode: str,
+    ) -> dict[str, Any]:
+        simple = query_mode == "simple_definition"
+        required = self._clean_state_list(raw.get("required_claims"), 4 if simple else 12)
+        if not required:
+            required = [chosen_blueprint.strip()]
+        active = self._clean_state_list(raw.get("active_concepts"), 6 if simple else 14)
+        optional = self._clean_state_list(raw.get("optional_concepts"), 2 if simple else 6)
+        suppressed = self._clean_state_list(raw.get("suppressed_concepts"), 10 if simple else 16)
+
+        try:
+            max_sentences = int(raw.get("max_sentences", 2 if simple else 8))
+        except (TypeError, ValueError):
+            max_sentences = 2 if simple else 8
+        max_sentences = max(1, min(2 if simple else 12, max_sentences))
+
+        try:
+            max_chars = int(raw.get("max_chars", 220 if simple else 2400))
+        except (TypeError, ValueError):
+            max_chars = 220 if simple else 2400
+        max_chars = max(80, min(320 if simple else 6000, max_chars))
+
+        return {
+            "schema": "jev_state_lock_v1",
+            "intent": str(raw.get("intent") or ("simple_definition" if simple else plan.get("intent") or "answer")).strip(),
+            "active_concepts": active,
+            "optional_concepts": optional,
+            "required_claims": required,
+            "suppressed_concepts": suppressed,
+            "register": str(raw.get("register") or self._infer_register(user_text, plan)).strip(),
+            "abstraction": str(raw.get("abstraction") or ("concrete_definition" if simple else "task_appropriate")).strip(),
+            "max_sentences": max_sentences,
+            "max_chars": max_chars,
+            "allow_new_factual_concepts": False,
+            "query_mode": query_mode,
+        }
+
+    def build_state_lock(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        chosen_blueprint: str,
+        verification_evidence: list[dict[str, Any]] | None = None,
+        query_mode: str = "normal",
+    ) -> dict[str, Any]:
+        """Compile the selected semantic route into a closed surface-generation state."""
+        simple = query_mode == "simple_definition"
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-6:],
+            "route": plan,
+            "selected_blueprint": chosen_blueprint,
+            "verification_evidence": verification_evidence or [],
+            "query_mode": query_mode,
+            "output_schema": {
+                "intent": "short label",
+                "active_concepts": ["concepts explicitly supported by the request/selected blueprint/evidence"],
+                "optional_concepts": ["at most nearby clarification already supported by those sources"],
+                "required_claims": ["claims that the answer must communicate"],
+                "suppressed_concepts": ["likely tangents or expansions that must not enter the final answer"],
+                "register": "user-matching register",
+                "abstraction": "surface abstraction level",
+                "max_sentences": 2 if simple else 8,
+                "max_chars": 220 if simple else 2400,
+            },
+            "rules": [
+                "This is semantic compression, not brainstorming.",
+                "ACTIVE, OPTIONAL, and REQUIRED content must be grounded in the user request, selected blueprint, or verification evidence.",
+                "Do not import facts from losing candidates or general world knowledge into ACTIVE/OPTIONAL/REQUIRED.",
+                "Put tempting but unnecessary expansions in SUPPRESSED instead of adding them to the answerable state.",
+                "For a simple definition, lock onto the conventional meaning and at most one nearby clarifier.",
+                "Do not write final prose. Return JSON only.",
+            ],
+        }
+        system = (
+            "Compile a CLOSED semantic state for a constrained answer verbalizer. "
+            "Your job is to reduce the state space, not expand it. Return JSON only."
+        )
+        result = self.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            reasoning_effort="low" if simple else "medium",
+            max_tokens=900 if simple else 1600,
+        )
+        parsed: dict[str, Any] = {}
+        try:
+            maybe = extract_json(result.text)
+            if isinstance(maybe, dict):
+                parsed = maybe
+        except (ValueError, json.JSONDecodeError):
+            parsed = {}
+        return self._sanitize_state_lock(
+            parsed,
+            user_text=user_text,
+            plan=plan,
+            chosen_blueprint=chosen_blueprint,
+            query_mode=query_mode,
+        )
+
+    @staticmethod
+    def _state_lock_problem(text: str, state_lock: dict[str, Any] | None) -> str | None:
+        if not state_lock:
+            return None
+        value = (text or "").strip()
+        if not value:
+            return "empty state-locked answer"
+        max_chars = int(state_lock.get("max_chars", 0) or 0)
+        if max_chars and len(value) > max_chars:
+            return f"state-lock length exceeded ({len(value)}>{max_chars})"
+        max_sentences = int(state_lock.get("max_sentences", 0) or 0)
+        if max_sentences:
+            sentence_count = len([x for x in re.split(r"(?<=[.!?。！？])\s+|\n+", value) if x.strip()])
+            if sentence_count > max_sentences:
+                return f"state-lock sentence budget exceeded ({sentence_count}>{max_sentences})"
+        lower = value.casefold()
+        for phrase in state_lock.get("suppressed_concepts") or []:
+            p = str(phrase).strip().casefold()
+            if len(p) >= 3 and p in lower:
+                return f"suppressed concept surfaced: {phrase}"
+        return None
+
+    @staticmethod
     def _finish_reason(result: SolarResult) -> str | None:
         raw = result.raw if isinstance(result.raw, dict) else {}
         try:
@@ -1026,6 +1210,7 @@ class SolarClient:
         reason: str,
         ceiling: int,
         verification_evidence: list[dict[str, Any]] | None = None,
+        state_lock: dict[str, Any] | None = None,
     ) -> str | None:
         payload = {
             "user_request": user_text,
@@ -1034,6 +1219,7 @@ class SolarClient:
             "winning_blueprint": chosen_blueprint,
             "supporting_survivors": supporting_blueprints,
             "verification_evidence": verification_evidence or [],
+            "state_lock": state_lock or {},
             "broken_or_incomplete_output": broken_output[-5000:],
             "repair_reason": reason,
             "requirements": [
@@ -1042,6 +1228,9 @@ class SolarClient:
                 "Do not return only a heading, label, outline fragment, or sentence stub.",
                 "Preserve the winning blueprint semantics except where verification evidence explicitly overrides it.",
                 "Never resurrect a claim marked FAIL by verification evidence.",
+                "When state_lock is present, use ONLY its required_claims, active_concepts, and optional_concepts.",
+                "Never introduce a new factual concept outside state_lock. Prefer omission over expansion.",
+                "Respect state_lock max_sentences/max_chars and never surface suppressed_concepts.",
                 "Do not mention this repair process or internal candidates.",
             ],
         }
@@ -1070,8 +1259,10 @@ class SolarClient:
                 plan=plan,
                 finish_reason=self._finish_reason(result),
             )
-            if candidate and problem is None:
+            lock_problem = self._state_lock_problem(candidate, state_lock)
+            if candidate and problem is None and lock_problem is None:
                 return candidate
+            problem = lock_problem or problem
             payload["broken_or_incomplete_output"] = candidate[-5000:]
             payload["repair_reason"] = problem or reason
         return None
@@ -1088,6 +1279,7 @@ class SolarClient:
         response_length: str,
         reasoning_effort: str,
         verification_evidence: list[dict[str, Any]] | None = None,
+        state_lock: dict[str, Any] | None = None,
     ) -> list[str]:
         count = max(1, min(6, count))
         length_data = next(
@@ -1095,32 +1287,57 @@ class SolarClient:
             (550, 1400, "normal complete answer"),
         )
         target, ceiling, desc = length_data
-        payload = {
-            "user_request": user_text,
-            "recent_conversation": history[-8:],
-            "route": plan,
-            "winning_blueprint": chosen_blueprint,
-            "supporting_survivors": supporting_blueprints,
-            "verification_evidence": verification_evidence or [],
-            "draft_count": count,
-            "response_length": {"name": response_length, "target_tokens": target, "description": desc},
-            "requirements": [
-                "Answer the user directly.",
-                "Preserve the semantic strengths of the winning blueprint.",
-                "Use supporting survivors only when they improve correctness or completeness.",
-                "Do not mention the internal network, candidates, scores, or hidden reasoning unless asked.",
-                "Each draft must independently answer the whole request.",
-                "When verification evidence is present, it overrides unsupported or failed claims from the original blueprint.",
-                "Do not resurrect a claim marked FAIL by the evidence report.",
-            ],
-        }
+        if state_lock:
+            # STATE LOCK: the surface model never sees losing blueprints. It is a
+            # verbalizer, not a second semantic search.
+            count = 1
+            payload = {
+                "user_request": user_text,
+                "recent_conversation": history[-4:],
+                "state_lock": state_lock,
+                "verification_evidence": verification_evidence or [],
+                "draft_count": 1,
+                "requirements": [
+                    "Verbalize the locked state; do not perform new semantic search.",
+                    "Use ONLY required_claims, active_concepts, and optional_concepts from state_lock.",
+                    "Do not add factual concepts, duties, examples, organizations, history, implications, or qualifications absent from state_lock.",
+                    "Never surface suppressed_concepts.",
+                    "Respect register, abstraction, max_sentences, and max_chars.",
+                    "Prefer a shorter sufficient answer over a broader answer.",
+                    "Do not mention the state lock, candidates, scores, or hidden reasoning.",
+                ],
+            }
+        else:
+            payload = {
+                "user_request": user_text,
+                "recent_conversation": history[-8:],
+                "route": plan,
+                "winning_blueprint": chosen_blueprint,
+                "supporting_survivors": supporting_blueprints,
+                "verification_evidence": verification_evidence or [],
+                "draft_count": count,
+                "response_length": {"name": response_length, "target_tokens": target, "description": desc},
+                "requirements": [
+                    "Answer the user directly.",
+                    "Preserve the semantic strengths of the winning blueprint.",
+                    "Use supporting survivors only when they improve correctness or completeness.",
+                    "Do not mention the internal network, candidates, scores, or hidden reasoning unless asked.",
+                    "Each draft must independently answer the whole request.",
+                    "When verification evidence is present, it overrides unsupported or failed claims from the original blueprint.",
+                    "Do not resurrect a claim marked FAIL by the evidence report.",
+                ],
+            }
 
         if count == 1:
             result = self.chat(
                 [
                     {
                         "role": "system",
-                        "content": "Render the selected blueprint into the best complete final user-facing answer. Return only the answer.",
+                        "content": (
+                            "You are a constrained verbalizer. If state_lock is supplied, you MUST stay inside it: "
+                            "no new factual concepts, no semantic expansion, no extra duties/examples unless explicitly allowed. "
+                            "Return only the complete user-facing answer."
+                        ),
                     },
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
@@ -1134,7 +1351,8 @@ class SolarClient:
                 plan=plan,
                 finish_reason=self._finish_reason(result),
             )
-            if text and problem is None:
+            lock_problem = self._state_lock_problem(text, state_lock)
+            if text and problem is None and lock_problem is None:
                 self.last_render_stats = {
                     "mode": "single", "protocol": "plain", "repaired": False, "drafts": 1
                 }
@@ -1147,9 +1365,10 @@ class SolarClient:
                 chosen_blueprint=chosen_blueprint,
                 supporting_blueprints=supporting_blueprints,
                 broken_output=text,
-                reason=problem or "empty final surface",
+                reason=lock_problem or problem or "empty final surface",
                 ceiling=ceiling,
                 verification_evidence=verification_evidence,
+                state_lock=state_lock,
             )
             self.last_render_stats = {
                 "mode": "single",
@@ -1216,6 +1435,7 @@ class SolarClient:
             reason=reason,
             ceiling=ceiling,
             verification_evidence=verification_evidence,
+            state_lock=state_lock,
         )
         self.last_render_stats = {
             "mode": "multi",
