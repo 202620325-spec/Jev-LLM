@@ -298,6 +298,8 @@ def main() -> int:
             print(json.dumps({
                 "pipeline": engine.pipeline_mode,
                 "intensity": engine.intensity,
+                "conversation_log_enabled": engine.config.conversation_log_enabled,
+                "conversation_log_path": str(engine.conversation_logger.path),
                 "seed_override": engine.seed_override,
                 "max_live_pool_override": engine.width_override,
                 "max_rounds_override": engine.layers_override,
@@ -310,6 +312,7 @@ def main() -> int:
                 print("usage: :compare <prompt>"); continue
             original_pipeline = engine.pipeline_mode
             original_history = list(engine.history)
+            compare_audit_cursor = engine.audit_cursor()
             try:
                 base_start = engine.solar.call_count
                 baseline_error = None
@@ -329,11 +332,24 @@ def main() -> int:
                 # half of the controlled comparison.
                 engine.history = list(original_history)
                 engine.pipeline_mode = "net"
-                net_answer = engine.answer(arg)
+                net_answer = engine.answer(arg, log_turn=False)
                 print(f"\n--- SOLAR BASELINE ({base_calls} Solar call) ---\n{baseline}")
                 if baseline_error:
                     print(f"[baseline recovery exhausted] {baseline_error}")
                 print(f"\n--- JEVNET ADAPTIVE ---\n{net_answer}")
+                engine.record_turn_log(
+                    question=arg,
+                    answer={
+                        "solar_baseline": baseline,
+                        "jevnet_adaptive": net_answer,
+                    },
+                    pipeline="compare",
+                    cursor=compare_audit_cursor,
+                    extra={
+                        "solar_baseline_calls": base_calls,
+                        "solar_baseline_error": baseline_error,
+                    },
+                )
                 print("\n[JevNet stats]", json.dumps(engine.last_stats, ensure_ascii=False))
             except (JevError, SolarError, ValueError, RuntimeError) as exc:
                 engine.history = original_history
