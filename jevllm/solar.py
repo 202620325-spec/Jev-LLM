@@ -1034,6 +1034,7 @@ class SolarClient:
         count: int,
         round_index: int,
         reasoning_effort: str = "high",
+        generation_mode: str = "normal",
     ) -> list[str]:
         """Generate only the candidates requested by Jev's adaptive search action."""
         action = action.upper()
@@ -1074,12 +1075,20 @@ class SolarClient:
             ],
         }
         instructions = operation_instructions.get(action, operation_instructions["REFILL"])
+        if generation_mode == "simple_definition":
+            instructions = [
+                "Stay on the same conventional meaning already supported by the user context.",
+                "Generate only a tighter or clearer grounded definition candidate.",
+                "Do not invent alternative senses, brands, certifications, organizations, incidents, hierarchy, or detailed duties.",
+                "Prefer returning fewer candidates over speculative diversity.",
+            ]
         payload = {
             "user_request": user_text,
             "recent_conversation": history[-8:],
             "route": plan,
             "adaptive_round": round_index + 1,
             "action": action,
+            "generation_mode": generation_mode,
             "parent_blueprints": [] if action == "REVIVE" else parents,
             "existing_pool": [] if action == "REVIVE" else existing[:24],
             "candidate_count": count,
@@ -1100,8 +1109,12 @@ class SolarClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-            reasoning_effort=reasoning_effort,
-            max_tokens=min(10000, max(4096, 1500 + count * 420)),
+            reasoning_effort="low" if generation_mode == "simple_definition" else reasoning_effort,
+            max_tokens=(
+                min(1800, max(900, 500 + count * 260))
+                if generation_mode == "simple_definition"
+                else min(10000, max(4096, 1500 + count * 420))
+            ),
         )
         out = self._recover_blueprints_lenient(result.text, count)
         if out:
