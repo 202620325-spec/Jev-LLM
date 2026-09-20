@@ -1,4 +1,4 @@
-# JevNet -> LLM v1.3.1
+# JevNet -> LLM v1.3.2
 
 CMD chat MVP combining:
 
@@ -158,6 +158,37 @@ A trace can look like:
 [Jev action R4] STOP ... ready=0.92
 ```
 
+## Automatic JSON conversation audit
+
+Every completed user turn is automatically appended to one local session file:
+
+```text
+logs/conversations/session_<UTC timestamp>_<id>.json
+```
+
+Each turn contains:
+
+- `question` and final `answer`
+- pipeline (`solar`, `net`, `legacy`, or `compare`)
+- provider-reported input/output token totals, split by Solar/Jev
+- every Solar request/response, including the provider-returned `message.reasoning` field as received
+- every Jev Decisions request and raw decision response
+- JevNet events such as plan, candidate evaluation, adaptive action, verification, blueprint selection, surface rendering, and final selection
+- last-turn search statistics
+
+Token totals are never guessed. If a provider response contains no usage object, that call is recorded as `reported: false` and counted under `unreported_calls`.
+
+The files are local runtime data and are ignored by git because they may contain prompts, answers, and model reasoning.
+
+Configuration:
+
+```env
+CONVERSATION_LOG_ENABLED=1
+CONVERSATION_LOG_DIR=logs/conversations
+```
+
+`:reset` clears chat history and starts a new log-session filename. `:profile` shows the current target log path. `:compare` stores the Solar baseline and JevNet answer together as one comparison turn.
+
 ## Testing
 
 ```bat
@@ -165,7 +196,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.3.1 offline status at patch time:
+v1.3.2 offline regression suite:
 
 - Python compile: PASS
 - unit/regression tests: **21/21 PASS**
