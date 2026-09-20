@@ -19,6 +19,7 @@ SEARCH_ACTIONS = (
     "MUTATE",
     "MERGE",
     "CHALLENGE",
+    "REVIVE",
     "VERIFY",
 )
 
@@ -516,7 +517,7 @@ class JevDecisionNetwork:
                 allowed_actions.append("VERIFY")
                 if remaining_generated > 0:
                     allowed_actions.extend([
-                        "REFILL", "DIVERSE_REFILL", "DEEPEN", "MUTATE", "MERGE", "CHALLENGE"
+                        "REFILL", "DIVERSE_REFILL", "DEEPEN", "MUTATE", "MERGE", "CHALLENGE", "REVIVE"
                     ])
 
             # COLLAPSE gate: unresolved contradictory answers cannot STOP merely
@@ -560,6 +561,8 @@ class JevDecisionNetwork:
             if action not in allowed_actions:
                 if material_conflict and not pool_already_verified and "VERIFY" in allowed_actions:
                     action = "VERIFY"
+                elif material_conflict and pool_already_verified and "REVIVE" in allowed_actions:
+                    action = "REVIVE"
                 elif material_conflict and "CHALLENGE" in allowed_actions:
                     action = "CHALLENGE"
                 else:
@@ -567,7 +570,9 @@ class JevDecisionNetwork:
 
             # Global loop breaker even when disagreement detection misses a conflict.
             if action == "VERIFY" and pool_already_verified:
-                if material_conflict and "CHALLENGE" in allowed_actions:
+                if material_conflict and "REVIVE" in allowed_actions:
+                    action = "REVIVE"
+                elif material_conflict and "CHALLENGE" in allowed_actions:
                     action = "CHALLENGE"
                 elif material_conflict and "DIVERSE_REFILL" in allowed_actions:
                     action = "DIVERSE_REFILL"
