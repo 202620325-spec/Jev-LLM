@@ -196,10 +196,14 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.3.2 offline regression suite:
+v1.3.2 regression suite currently defines **28 tests**.
 
-- Python compile: PASS
-- unit/regression tests: **21/21 PASS**
+Run locally:
+
+```bat
+python -m compileall -q .
+python -m unittest discover -s tests -v
+```
 
 Tests cover, among other things:
 
