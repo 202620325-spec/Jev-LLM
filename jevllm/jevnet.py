@@ -694,15 +694,21 @@ class JevDecisionNetwork:
         # score erase the new evidence.
         evidence_winners = [n for n in nodes if n.metrics.get("evidence_resolved_winner", 0.0) >= 1.0]
         if evidence_winners:
-            winner_ids = {n.id for n in evidence_winners}
-            nodes = evidence_winners + [n for n in nodes if n.id not in winner_ids]
+            # Once a discriminating test actually resolves the contradiction,
+            # do not let a later style/plausibility vote overturn that evidence.
+            finalists = evidence_winners[: min(8, len(evidence_winners))]
+        else:
+            finalists = nodes[: min(8, len(nodes))]
 
-        finalists = nodes[: min(8, len(nodes))]
-        chosen_plan_idx, plan_raw = self.jev.choose_blueprint(
-            user_text=user_text,
-            plan=plan,
-            candidates=[n.text for n in finalists],
-        )
+        if len(finalists) == 1 and evidence_winners:
+            chosen_plan_idx = 0
+            plan_raw = {"selection_source": "resolved_evidence"}
+        else:
+            chosen_plan_idx, plan_raw = self.jev.choose_blueprint(
+                user_text=user_text,
+                plan=plan,
+                candidates=[n.text for n in finalists],
+            )
         chosen_blueprint = finalists[chosen_plan_idx].text
         self.emit("blueprint_selection", {
             "index": chosen_plan_idx,
