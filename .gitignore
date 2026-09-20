@@ -22,3 +22,6 @@ Thumbs.db
 
 # Local outputs
 *.log
+
+# Conversation audit data (may contain prompts/reasoning)
+logs/conversations/
