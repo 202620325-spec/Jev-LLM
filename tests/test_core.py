@@ -15,7 +15,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(score_level(answer, 6), 3)
 
     def test_extract_json_from_fence(self):
-        self.assertEqual(extract_json(''''json\n{"a":1}\n''''), {"a": 1})
+        self.assertEqual(extract_json('```json\n{"a":1}\n```'), {"a": 1})
 
     def test_recover_object_candidates(self):
         text = '{"candidates":[{"text":"alpha"},{"content":"beta"}]}'
