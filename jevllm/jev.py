@@ -229,6 +229,88 @@ class JevClient:
                 })
         return results
 
+    def assess_disagreement(
+        self,
+        *,
+        user_text: str,
+        plan: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Detect answer-changing disagreement without pretending to resolve truth.
+
+        Jev is used here for what it is good at: identifying which hypotheses
+        conflict and which rival should be preserved. Truth is delegated to an
+        evidence-producing verifier.
+        """
+        if len(candidates) < 2:
+            return {
+                "material_disagreement": 0.0,
+                "needs_test": 0.0,
+                "leader_id": str(candidates[0].get("id")) if candidates else None,
+                "rival_id": None,
+                "raw": {},
+            }
+
+        top = candidates[: min(8, len(candidates))]
+        leader_id = str(top[0].get("id", "C0"))
+        records = [{
+            "id": str(item.get("id", f"C{i}")),
+            "record": json.dumps({
+                "candidate": item.get("text", ""),
+                "activation": item.get("activation", 0.5),
+                "uncertainty": item.get("uncertainty", 0.5),
+            }, ensure_ascii=False),
+        } for i, item in enumerate(top)]
+
+        rival_criteria = {"NONE": "No surviving candidate materially contradicts the leader's answer-changing conclusion."}
+        for item in top[1:]:
+            cid = str(item.get("id", ""))
+            rival_criteria[cid] = (
+                f"Candidate {cid} is the strongest materially incompatible rival to {leader_id}; "
+                "choosing between them could change the final answer."
+            )
+
+        data = self.decide(
+            {
+                "description": (
+                    "Detect material hypothesis disagreement. Do NOT decide which candidate is true. "
+                    "Find whether the live pool contains mutually incompatible answer-changing conclusions."
+                ),
+                "records": records,
+                "context": {"user_request": user_text, "solar_plan": plan, "leader_id": leader_id},
+            },
+            {
+                "material_disagreement": {
+                    "type": "noul",
+                    "instructions": "Do the live candidates contain mutually incompatible conclusions or claims that would change the final answer?",
+                    "true_when": "At least two viable candidates cannot both be correct on an answer-changing point.",
+                    "false_when": "Differences are mostly wording, detail, or compatible approaches.",
+                },
+                "strongest_rival": {
+                    "type": "choice",
+                    "instructions": "Choose the strongest materially incompatible rival to the current leader, or NONE.",
+                    "criteria": rival_criteria,
+                },
+                "needs_discriminating_test": {
+                    "type": "noul",
+                    "instructions": "Would selecting a winner by more semantic scoring risk amplifying an unverified assumption?",
+                    "true_when": "A concrete falsifying/checking test is needed before collapse.",
+                    "false_when": "No material contradiction remains or existing evidence already resolves it.",
+                },
+            },
+        )
+        answers = data.get("answers") or {}
+        rival_id = str(answers.get("strongest_rival", {}).get("choice", "NONE"))
+        if rival_id == "NONE" or rival_id not in rival_criteria:
+            rival_id = None
+        return {
+            "material_disagreement": noul_probability(answers.get("material_disagreement", {}), 0.5),
+            "needs_test": noul_probability(answers.get("needs_discriminating_test", {}), 0.5),
+            "leader_id": leader_id,
+            "rival_id": rival_id,
+            "raw": data,
+        }
+
     def search_action(
         self,
         *,
@@ -287,7 +369,7 @@ class JevClient:
             "MUTATE": "Repair or alter promising candidates to remove weak assumptions or constraint failures.",
             "MERGE": "Combine complementary strengths from multiple surviving candidates into new candidates.",
             "CHALLENGE": "Generate adversarial/counter-hypotheses that attack the strongest current route and expose hidden errors.",
-            "VERIFY": "Do not generate new proposals yet; spend the next step re-checking the strongest existing candidates more strictly.",
+            "VERIFY": "Run one evidence-producing discriminating test on materially conflicting hypotheses. Do not repeat semantic scoring of the same unchanged candidates.",
         }
         action_criteria = {a: action_descriptions[a] for a in allowed_actions if a in action_descriptions}
         if not action_criteria:
@@ -319,7 +401,9 @@ class JevClient:
                 "type": "choice",
                 "instructions": (
                     "Choose the single next search action that maximizes expected answer quality per remaining compute. "
-                    "Choose STOP as soon as more search is unlikely to materially improve the answer."
+                    "VERIFY means obtain new discriminating evidence, not re-score confidence. "
+                    "Never repeat VERIFY on the same unchanged hypothesis set. "
+                    "Choose STOP only when no unresolved answer-changing disagreement remains."
                 ),
                 "criteria": action_criteria,
             },
