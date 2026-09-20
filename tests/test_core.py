@@ -367,6 +367,112 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(out, ["usable blueprint"])
 
+    def test_final_markdown_answer_is_not_split_into_heading_fragments(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+        markdown = (
+            "**Answer.** The minimum is 5.\n\n"
+            "**Construction.**\n"
+            "- Classifier A is correct on examples 1,2,3.\n"
+            "- Classifier B is correct on examples 1,4,5.\n\n"
+            "**Minimality.** For n < 5, the required integer counts cannot coexist."
+        )
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((messages, reasoning_effort, max_tokens))
+            return SolarResult(
+                text=markdown,
+                raw={"choices": [{"finish_reason": "stop"}]},
+            )
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.render_answer_drafts(
+            user_text="Find the minimum; give a construction and prove minimality.",
+            history=[],
+            plan={"answer_shape": "construction plus proof", "required_points": ["construction", "minimality"]},
+            chosen_blueprint="n=5 with a construction and lower-bound proof",
+            supporting_blueprints=[],
+            count=5,
+            response_length="medium",
+            reasoning_effort="high",
+        )
+        self.assertEqual(out, [markdown])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(solar.last_render_stats["protocol"], "raw_prose")
+        self.assertFalse(solar.last_render_stats["repaired"])
+
+    def test_truncated_final_fragment_is_repaired_instead_of_selected(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+        repaired = (
+            "The minimum is n=5. Construction: choose three classifiers whose "
+            "correctness sets overlap so each has 3/5 accuracy while majority is "
+            "correct on only 2/5 examples. Minimality follows by checking n<5."
+        )
+        replies = iter([
+            SolarResult(
+                text="*Construction.**",
+                raw={"choices": [{"finish_reason": "length"}]},
+            ),
+            SolarResult(
+                text=repaired,
+                raw={"choices": [{"finish_reason": "stop"}]},
+            ),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((messages, reasoning_effort, max_tokens))
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.render_answer_drafts(
+            user_text="Find the minimum; give a construction and prove minimality.",
+            history=[],
+            plan={"answer_shape": "construction plus proof", "required_points": ["construction", "minimality"]},
+            chosen_blueprint="n=5; construct and prove lower bound",
+            supporting_blueprints=[],
+            count=5,
+            response_length="medium",
+            reasoning_effort="high",
+        )
+        self.assertEqual(out, [repaired])
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(solar.last_render_stats["repaired"])
+        self.assertEqual(solar.last_render_stats["finish_reason"], "length")
+
+    def test_valid_structured_final_drafts_keep_multi_draft_selection_without_repair(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+        raw = (
+            '{"candidates":['
+            '"The minimum is 5; here is a complete construction and minimality proof.",'
+            '"n=5. A full alternative construction follows, together with the lower-bound proof."'
+            ']}'
+        )
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((messages, reasoning_effort, max_tokens))
+            return SolarResult(text=raw, raw={"choices": [{"finish_reason": "stop"}]})
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.render_answer_drafts(
+            user_text="Find the minimum; give a construction and prove minimality.",
+            history=[],
+            plan={"answer_shape": "construction plus proof", "required_points": ["construction", "minimality"]},
+            chosen_blueprint="n=5",
+            supporting_blueprints=[],
+            count=2,
+            response_length="medium",
+            reasoning_effort="high",
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(solar.last_render_stats["protocol"], "structured")
+        self.assertFalse(solar.last_render_stats["repaired"])
+
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
         solar = SolarClient(config)
