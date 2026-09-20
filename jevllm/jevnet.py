@@ -51,6 +51,7 @@ class CandidateNode:
     layer_history: list[dict[str, float]] = field(default_factory=list)
     evaluated: bool = False
     evidence: list[dict[str, Any]] = field(default_factory=list)
+    diversity_factor: float = 1.0
 
 
 # These are ceilings, not fixed search sizes.
@@ -163,14 +164,17 @@ class JevDecisionNetwork:
         return len(sa & sb) / max(1, len(sa | sb))
 
     def _diversity_adjust(self, nodes: list[CandidateNode]) -> None:
+        """Compute a temporary diversity factor; never compound it across rounds."""
         ranked = sorted(nodes, key=lambda n: n.activation, reverse=True)
         accepted: list[CandidateNode] = []
         for node in ranked:
             max_sim = max((self._lexical_similarity(node.text, other.text) for other in accepted), default=0.0)
             if max_sim > 0.86:
-                node.activation *= 0.86
+                node.diversity_factor = 0.86
             elif max_sim > 0.72:
-                node.activation *= 0.94
+                node.diversity_factor = 0.94
+            else:
+                node.diversity_factor = 1.0
             accepted.append(node)
 
     def _competitive_filter(
@@ -184,12 +188,18 @@ class JevDecisionNetwork:
             return []
         protected_ids = protected_ids or set()
         self._diversity_adjust(nodes)
-        ranked = sorted(nodes, key=lambda n: (n.activation, n.survival, -n.uncertainty), reverse=True)
-        top = ranked[0].activation
+        ranked = sorted(
+            nodes,
+            key=lambda n: (n.activation * n.diversity_factor, n.survival, -n.uncertainty),
+            reverse=True,
+        )
+        top = ranked[0].activation * ranked[0].diversity_factor
         floor = max(0.36, top - 0.34)
         kept = [
             n for n in ranked
-            if n.id in protected_ids or n.activation >= floor or n.survival >= 0.58
+            if n.id in protected_ids
+            or n.activation * n.diversity_factor >= floor
+            or n.survival >= 0.58
         ]
         minimum = min(3, len(ranked))
         if len(kept) < minimum:
