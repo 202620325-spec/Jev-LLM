@@ -1,4 +1,4 @@
-# JevNet -> LLM v1.3.2
+# JevNet -> LLM v1.4.0
 
 CMD chat MVP combining:
 
@@ -158,6 +158,40 @@ A trace can look like:
 [Jev action R4] STOP ... ready=0.92
 ```
 
+## v1.4: disagreement before collapse
+
+v1.4 changes VERIFY from repeated Jev plausibility scoring into evidence acquisition.
+
+The adaptive loop now follows this rule:
+
+```text
+Generate hypotheses
+  -> evaluate new hypotheses once
+  -> detect answer-changing disagreement
+  -> PRESERVE leader + strongest incompatible rival
+  -> VERIFY by a discriminating evidence test
+       - replay a construction
+       - substitute/check equations
+       - derive an invariant
+       - try a counterexample
+       - use an external deterministic verifier when one is attached
+  -> FAIL evidence can eliminate a high-scoring hypothesis
+  -> unresolved same-pool VERIFY cannot repeat
+  -> CHALLENGE / DIVERSE instead
+  -> COLLAPSE only after disagreement is resolved or no material conflict remains
+```
+
+Important implementation changes:
+
+- unchanged candidates are not fully re-scored by Jev every round;
+- one unchanged pool can be VERIFY'd only once;
+- Jev detects disagreement but does not certify truth;
+- Solar performs the default evidence-producing verification;
+- `JevDecisionNetwork(..., verifier=...)` accepts an external deterministic verifier hook, intended for environments such as JevCoder where compile/test/typecheck/runtime checks are available;
+- a hypothesis with strong concrete FAIL evidence is excluded from final selection when a non-falsified alternative survives;
+- a conflict explicitly resolved by evidence cannot later be overturned by a pure semantic/style vote;
+- the Solar route planner retries when provider-side reasoning consumes the whole output budget and visible JSON is empty.
+
 ## Automatic JSON conversation audit
 
 Every completed user turn is automatically appended to one local session file:
@@ -196,7 +230,7 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-v1.3.2 regression suite currently defines **28 tests**.
+v1.4.0 regression suite currently defines **28 tests**.
 
 Run locally:
 
