@@ -23,6 +23,8 @@ class Config:
     default_run_mode: str = "fast"
     debug: bool = False
     jev_batch_size: int = 8
+    conversation_log_enabled: bool = True
+    conversation_log_dir: str = "logs/conversations"
 
     @classmethod
     def load(cls, env_path: str | Path | None = None) -> "Config":
@@ -61,6 +63,8 @@ class Config:
             default_run_mode=run_mode,
             debug=os.getenv("DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"},
             jev_batch_size=max(1, min(20, as_int("JEV_BATCH_SIZE", 8))),
+            conversation_log_enabled=os.getenv("CONVERSATION_LOG_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            conversation_log_dir=os.getenv("CONVERSATION_LOG_DIR", "logs/conversations").strip() or "logs/conversations",
         )
 
     def validate(self) -> list[str]:
