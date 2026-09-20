@@ -14,7 +14,7 @@ from jevllm.solar import SolarError
 
 BANNER = r"""
 ======================================================================
- JEVNET -> LLM v1.4 | Evidence-gated Jev search over Solar proposal space
+ JEVNET -> LLM v1.5 | State-locked + claim-audited Jev search over Solar
 ======================================================================
  Jev decides: STOP / REFILL / DIVERSE / DEEPEN / MUTATE / MERGE /
               CHALLENGE / REVIVE / VERIFY
@@ -35,7 +35,8 @@ def make_event_sink(state: dict[str, bool]):
                 f"\n[JevNet cap] profile={p['name']} seed={p['initial_seed']} "
                 f"rounds<={p['max_rounds']} live_pool<={p['max_live_pool']} "
                 f"generated<={p['max_generated']} refill<={p['max_refill']} "
-                f"drafts={p['final_drafts']}"
+                f"drafts={p['final_drafts']} mode={data.get('query_mode')} "
+                f"claim_audit={data.get('claim_audit_required')}"
             )
             return
 
@@ -89,6 +90,35 @@ def make_event_sink(state: dict[str, bool]):
             )
             return
 
+        if event == "state_lock" and state["trace"]:
+            s = data.get("state", {})
+            print(
+                f"[STATE LOCK] intent={s.get('intent')} active={len(s.get('active_concepts', []))} "
+                f"optional={len(s.get('optional_concepts', []))} "
+                f"suppressed={len(s.get('suppressed_concepts', []))} "
+                f"sentences<={s.get('max_sentences')} chars<={s.get('max_chars')}"
+            )
+            return
+
+        if event == "claim_audit" and state["trace"]:
+            a = data.get("audit", {})
+            print(
+                f"[CLAIM AUDIT {data.get('stage')}] status={a.get('status')} "
+                f"failed={len(a.get('failed_claims', []))} "
+                f"uncertain={len(a.get('uncertain_claims', []))}"
+            )
+            return
+
+        if event == "state_conformance" and state["trace"]:
+            a = data.get("audit", {})
+            print(
+                f"[STATE CHECK] violation={a.get('state_violation', 0.0):.2f} "
+                f"expansion={a.get('unsupported_expansion', 0.0):.2f} "
+                f"register={a.get('register_match', 0.0):.2f} "
+                f"length={a.get('length_match', 0.0):.2f}"
+            )
+            return
+
         if event == "surface_render" and state["trace"]:
             s = data.get("stats", {})
             print(
@@ -131,6 +161,12 @@ def make_event_sink(state: dict[str, bool]):
                 )
         elif event == "blueprint_selection":
             print(f"[Jev blueprint] C{data['index']} -> {data['blueprint']}")
+        elif event == "state_lock":
+            print("[STATE LOCK]", json.dumps(data.get("state", {}), ensure_ascii=False, indent=2))
+        elif event == "claim_audit":
+            print(f"[CLAIM AUDIT {data.get('stage')}]", json.dumps(data.get("audit", {}), ensure_ascii=False, indent=2))
+        elif event == "state_conformance":
+            print("[STATE CONFORMANCE]", json.dumps(data.get("audit", {}), ensure_ascii=False, indent=2))
         elif event == "surface_render":
             print("[Surface render]", json.dumps(data.get("stats", {}), ensure_ascii=False, indent=2))
         elif event == "final_drafts":
