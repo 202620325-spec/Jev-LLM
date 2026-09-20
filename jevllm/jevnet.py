@@ -422,6 +422,8 @@ class JevDecisionNetwork:
         )
         if not drafts:
             raise RuntimeError("Solar produced zero final answer drafts")
+        surface_render = dict(getattr(self.solar, "last_render_stats", {}) or {})
+        self.emit("surface_render", {"stats": surface_render})
         self.emit("final_drafts", {"drafts": drafts})
 
         if len(drafts) == 1:
@@ -443,6 +445,7 @@ class JevDecisionNetwork:
             "live_pool_at_finish": len(nodes),
             "final_blueprints": len(finalists),
             "final_drafts": len(drafts),
+            "surface_render": surface_render,
             "adaptive_actions": [d.get("action") for d in action_history],
             "action_history": action_history,
             "stop_reason": stop_reason,
