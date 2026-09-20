@@ -97,18 +97,24 @@ class JevLLM:
         extra: dict[str, Any] | None = None,
     ) -> str | None:
         calls, events = self._audit_slice(cursor)
-        path = self.conversation_logger.append_turn(
-            question=question,
-            answer=answer,
-            pipeline=pipeline,
-            calls=calls,
-            events=events,
-            stats=dict(self.last_stats),
-            extra=extra,
-        )
+        try:
+            path = self.conversation_logger.append_turn(
+                question=question,
+                answer=answer,
+                pipeline=pipeline,
+                calls=calls,
+                events=events,
+                stats=dict(self.last_stats),
+                extra=extra,
+            )
+        except Exception as exc:
+            self.last_log_path = None
+            self.last_stats["conversation_log_error"] = f"{type(exc).__name__}: {exc}"
+            return None
         self.last_log_path = str(path) if path is not None else None
         if self.last_log_path is not None:
             self.last_stats["conversation_log"] = self.last_log_path
+            self.last_stats.pop("conversation_log_error", None)
         return self.last_log_path
 
     def _remember(self, user_text: str, answer: str) -> None:
