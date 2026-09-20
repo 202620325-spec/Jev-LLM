@@ -5,6 +5,7 @@ from typing import Any
 
 import requests
 
+from .audit import make_call_record
 from .config import Config
 from .types import (
     BREADTH_LEVELS,
@@ -25,6 +26,7 @@ class JevClient:
     def __init__(self, config: Config):
         self.config = config
         self.call_count = 0
+        self.audit_calls: list[dict[str, Any]] = []
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -38,17 +40,55 @@ class JevClient:
     def decide(self, state: dict[str, Any], questions: dict[str, Any]) -> dict[str, Any]:
         payload = {"model": self.config.jev_model, "state": state, "questions": questions}
         self.call_count += 1
+        request_log = {"state": state, "questions": questions}
         try:
             response = self.session.post(self.config.jev_url, json=payload, timeout=self.config.request_timeout)
         except requests.RequestException as exc:
+            self.audit_calls.append(make_call_record(
+                provider="jev",
+                model=self.config.jev_model,
+                request=request_log,
+                response=None,
+                usage={"reported": False, "input_tokens": 0, "output_tokens": 0},
+                error={"type": type(exc).__name__, "message": str(exc)},
+            ))
             raise JevError(f"Jev request failed: {exc}") from exc
 
         if not response.ok:
             body = response.text[:2000]
+            self.audit_calls.append(make_call_record(
+                provider="jev",
+                model=self.config.jev_model,
+                request=request_log,
+                response={"http_status": response.status_code, "body": body},
+                usage={"reported": False, "input_tokens": 0, "output_tokens": 0},
+                error={"type": "HTTPError", "message": f"HTTP {response.status_code}"},
+            ))
             raise JevError(f"Jev HTTP {response.status_code}: {body}")
 
         data = response.json()
         answers = data.get("answers")
+        usage_raw = data.get("usage") if isinstance(data, dict) else None
+        usage_raw = usage_raw if isinstance(usage_raw, dict) else {}
+        input_tokens = int(usage_raw.get("prompt_tokens", usage_raw.get("input_tokens", 0)) or 0)
+        output_tokens = int(usage_raw.get("completion_tokens", usage_raw.get("output_tokens", 0)) or 0)
+        usage_reported = bool(usage_raw)
+        self.audit_calls.append(make_call_record(
+            provider="jev",
+            model=self.config.jev_model,
+            request=request_log,
+            response={
+                "reasoning": data.get("reasoning") if isinstance(data, dict) else None,
+                "analysis": data.get("analysis") if isinstance(data, dict) else None,
+                "raw": data,
+            },
+            usage={
+                "reported": usage_reported,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "raw": usage_raw,
+            },
+        ))
         if not isinstance(answers, dict):
             raise JevError(f"Unexpected Jev response: {data}")
         return data
