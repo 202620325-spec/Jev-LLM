@@ -300,5 +300,72 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(d["focus_id"], "N1")
         self.assertAlmostEqual(d["ready_to_stop"], 0.12)
 
+    def test_expand_paths_recovers_non_json_and_marker_retry(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        replies = iter([
+            SolarResult(text="A strong direct consistency argument."),
+            SolarResult(text="CANDIDATE::Use an impossibility proof.\nCANDIDATE::Relax one availability constraint."),
+            SolarResult(text="Plain repair candidate."),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.expand_reasoning_paths(
+            user_text="q", history=[], plan={"route": ["check consistency"]},
+            count=4, stage="seed", reasoning_effort="high",
+        )
+        self.assertGreaterEqual(len(out), 3)
+        self.assertIn("A strong direct consistency argument.", out)
+        self.assertTrue(any("impossibility proof" in x for x in out))
+
+    def test_expand_paths_all_empty_uses_route_fallback_instead_of_error(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return SolarResult(text="")
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.expand_reasoning_paths(
+            user_text="hard request", history=[],
+            plan={"intent": "detect contradiction", "route": ["enumerate", "challenge", "conclude"]},
+            count=8, stage="adaptive seed population", reasoning_effort="high",
+        )
+        self.assertEqual(len(out), 1)
+        self.assertIn("Intent: detect contradiction", out[0])
+        self.assertIn("Route: enumerate -> challenge -> conclude", out[0])
+
+    def test_adaptive_operation_all_empty_reuses_survivor(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return SolarResult(text="")
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.adaptive_reasoning_operation(
+            action="CHALLENGE", user_text="q", history=[], plan={},
+            parents=["known survivor"], existing=["known survivor", "other"],
+            count=6, round_index=4, reasoning_effort="high",
+        )
+        self.assertEqual(out, ["known survivor"])
+
+    def test_single_final_draft_empty_falls_back_to_winning_blueprint(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            return SolarResult(text="")
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        out = solar.render_answer_drafts(
+            user_text="q", history=[], plan={}, chosen_blueprint="usable blueprint",
+            supporting_blueprints=[], count=1, response_length="medium", reasoning_effort="high",
+        )
+        self.assertEqual(out, ["usable blueprint"])
+
 if __name__ == "__main__":
     unittest.main()
