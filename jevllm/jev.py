@@ -148,52 +148,100 @@ class JevClient:
         layer_index: int,
         total_layers: int,
         batch_size: int = 8,
+        evaluation_mode: str = "normal",
     ) -> list[dict[str, Any]]:
         if not candidates:
             return []
         results: list[dict[str, Any]] = []
         batch_size = max(1, min(20, batch_size))
 
-        metric_criteria = {
-            "fit": [
-                "Misses the request or answers a different problem.", "Weakly related but materially off-target.",
-                "Partly addresses the request.", "Mostly fits the user's actual request.",
-                "Strong direct fit with only small omissions.", "Excellent fit to intent, constraints and requested output.",
-            ],
-            "correctness": [
-                "Likely wrong or internally invalid.", "Major correctness concerns.", "Several uncertain or weak claims.",
-                "Plausibly correct with manageable uncertainty.", "Strong correctness likelihood.", "Very strong correctness likelihood under available information.",
-            ],
-            "constraints": [
-                "Violates core constraints.", "Misses several important constraints.", "Meets some constraints.",
-                "Meets most explicit constraints.", "Meets nearly all constraints.", "Very strong instruction/constraint satisfaction.",
-            ],
-            "coherence": [
-                "Contradictory or structurally broken.", "Major logical gaps.", "Some weak links.",
-                "Generally coherent.", "Strong internal logic.", "Exceptionally coherent and mutually consistent.",
-            ],
-            "coverage": [
-                "Leaves out the core need.", "Very incomplete.", "Covers a minority of necessary ground.",
-                "Covers the main ground.", "Broad useful coverage.", "Covers all material parts without obvious bloat.",
-            ],
-            "uncertainty": [
-                "Low uncertainty; few unsupported assumptions.", "Small uncertainty.", "Moderate-low uncertainty.",
-                "Moderate uncertainty or assumption load.", "High uncertainty.", "Very high uncertainty / fragile assumptions.",
-            ],
-        }
+        simple_definition = evaluation_mode == "simple_definition"
+        if simple_definition:
+            metric_criteria = {
+                "fit": [
+                    "Does not identify the term in the user's stated context.",
+                    "Weak/ambiguous identification.",
+                    "Mostly identifies the intended meaning.",
+                    "Directly identifies the conventional meaning.",
+                    "Very precise contextual definition.",
+                    "Exact, concise contextual definition.",
+                ],
+                "correctness": [
+                    "Likely invented or wrong.",
+                    "Major factual concern.",
+                    "Material unsupported assumption.",
+                    "Plausibly correct.",
+                    "Strongly grounded and correct.",
+                    "Very strong correctness likelihood.",
+                ],
+                "scope_discipline": [
+                    "Invents unrelated senses/brands/certifications/roles.",
+                    "Major unsupported expansion.",
+                    "Several unnecessary expansions.",
+                    "Mostly stays inside the requested meaning.",
+                    "Very focused with only useful nearby clarification.",
+                    "Strictly stays inside the requested semantic state.",
+                ],
+                "directness": [
+                    "Avoids the definition.",
+                    "Buried in irrelevant detail.",
+                    "Partly direct.",
+                    "Direct enough.",
+                    "Very direct.",
+                    "Minimal sufficient definition.",
+                ],
+            }
+        else:
+            metric_criteria = {
+                "fit": [
+                    "Misses the request or answers a different problem.", "Weakly related but materially off-target.",
+                    "Partly addresses the request.", "Mostly fits the user's actual request.",
+                    "Strong direct fit with only small omissions.", "Excellent fit to intent, constraints and requested output.",
+                ],
+                "correctness": [
+                    "Likely wrong or internally invalid.", "Major correctness concerns.", "Several uncertain or weak claims.",
+                    "Plausibly correct with manageable uncertainty.", "Strong correctness likelihood.", "Very strong correctness likelihood under available information.",
+                ],
+                "constraints": [
+                    "Violates core constraints.", "Misses several important constraints.", "Meets some constraints.",
+                    "Meets most explicit constraints.", "Meets nearly all constraints.", "Very strong instruction/constraint satisfaction.",
+                ],
+                "coherence": [
+                    "Contradictory or structurally broken.", "Major logical gaps.", "Some weak links.",
+                    "Generally coherent.", "Strong internal logic.", "Exceptionally coherent and mutually consistent.",
+                ],
+                "coverage": [
+                    "Leaves out the core need.", "Very incomplete.", "Covers a minority of necessary ground.",
+                    "Covers the main ground.", "Broad useful coverage.", "Covers all material parts without obvious bloat.",
+                ],
+                "uncertainty": [
+                    "Low uncertainty; few unsupported assumptions.", "Small uncertainty.", "Moderate-low uncertainty.",
+                    "Moderate uncertainty or assumption load.", "High uncertainty.", "Very high uncertainty / fragile assumptions.",
+                ],
+            }
 
         for offset in range(0, len(candidates), batch_size):
             chunk = candidates[offset: offset + batch_size]
+            # Request/plan are shared context, not repeated inside every record.
             records = [{
                 "id": f"C{offset+i}",
-                "record": json.dumps({"candidate": text, "user_request": user_text, "solar_plan": plan}, ensure_ascii=False),
+                "record": json.dumps({"candidate": text}, ensure_ascii=False),
             } for i, text in enumerate(chunk)]
             state = {
                 "description": (
-                    f"Candidate answer blueprints for one user request. Evaluation layer {layer_index+1}/{total_layers}; "
-                    "each record contains the candidate and its request context."
+                    f"Candidate answer blueprints for one user request. Evaluation layer {layer_index+1}/{total_layers}. "
+                    + (
+                        "This is a simple definition task: reward grounded meaning and scope discipline; penalize invented diversity."
+                        if simple_definition
+                        else "Judge semantic quality and correctness potential."
+                    )
                 ),
                 "records": records,
+                "context": {
+                    "user_request": user_text,
+                    "solar_plan": plan,
+                    "evaluation_mode": evaluation_mode,
+                },
             }
             questions: dict[str, Any] = {}
             for i, _text in enumerate(chunk):
@@ -201,30 +249,46 @@ class JevClient:
                 for metric, criteria in metric_criteria.items():
                     questions[f"{cid}__{metric}"] = {
                         "type": "score",
-                        "instructions": f"For the record with id {cid}: rate {metric} relative to the user request and route.",
+                        "instructions": f"For record {cid}, rate {metric} relative to the shared user request.",
                         "criteria": criteria,
                     }
                 questions[f"{cid}__survive"] = {
                     "type": "noul",
-                    "instructions": f"For the record with id {cid}: should this candidate survive to the next competitive layer?",
-                    "true_when": "It contains enough value/correctness potential to remain in competition.",
-                    "false_when": "It is dominated, off-target, too fragile, or not worth further compute.",
+                    "instructions": (
+                        f"Should {cid} survive? For a simple definition, false when it invents alternate senses "
+                        "or expands beyond a minimal grounded definition."
+                        if simple_definition
+                        else f"Should {cid} survive to the next competitive layer?"
+                    ),
+                    "true_when": "It remains a useful, correct candidate.",
+                    "false_when": "It is dominated, unsupported, off-target, or unnecessarily expansive.",
                 }
+
             data = self.decide(state, questions)
             answers = data["answers"]
             for i, _text in enumerate(chunk):
                 cid = f"C{offset+i}"
                 metrics = {m: score_expectation(answers.get(f"{cid}__{m}", {}), 6) for m in metric_criteria}
                 survival = noul_probability(answers.get(f"{cid}__survive", {}), 0.5)
-                positive = (
-                    0.21 * metrics["fit"] + 0.23 * metrics["correctness"] + 0.16 * metrics["constraints"]
-                    + 0.14 * metrics["coherence"] + 0.13 * metrics["coverage"] + 0.13 * (1.0 - metrics["uncertainty"])
-                )
+                if simple_definition:
+                    positive = (
+                        0.34 * metrics["fit"]
+                        + 0.34 * metrics["correctness"]
+                        + 0.20 * metrics["scope_discipline"]
+                        + 0.12 * metrics["directness"]
+                    )
+                    uncertainty = max(0.0, min(1.0, 1.0 - metrics["correctness"]))
+                else:
+                    positive = (
+                        0.21 * metrics["fit"] + 0.23 * metrics["correctness"] + 0.16 * metrics["constraints"]
+                        + 0.14 * metrics["coherence"] + 0.13 * metrics["coverage"] + 0.13 * (1.0 - metrics["uncertainty"])
+                    )
+                    uncertainty = metrics["uncertainty"]
                 activation = max(0.0, min(1.0, 0.84 * positive + 0.16 * survival))
                 results.append({
                     "activation": activation,
                     "survival": survival,
-                    "uncertainty": metrics["uncertainty"],
+                    "uncertainty": uncertainty,
                     "metrics": metrics,
                 })
         return results
