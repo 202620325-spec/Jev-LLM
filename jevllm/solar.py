@@ -119,6 +119,113 @@ class SolarClient:
         }.get(horizon, 220)
         return min(1800, base + max(0, breadth - 1) * 160)
 
+    @staticmethod
+    def _dedupe_texts(items: list[str], limit: int) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            value = " ".join((item or "").strip().split())
+            if not value:
+                continue
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(value)
+            if len(out) >= limit:
+                break
+        return out
+
+    @classmethod
+    def _recover_blueprints_lenient(cls, text: str, limit: int) -> list[str]:
+        """Recover semantic candidates without making JSON format a hard dependency.
+
+        The normal parser remains first. If Solar returns valid prose instead of the
+        requested wrapper, that prose is still usable as one candidate rather than
+        crashing the entire inference search.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return []
+
+        recovered = recover_candidate_strings(raw, limit)
+        if recovered:
+            return cls._dedupe_texts(recovered, limit)
+
+        # Explicit fallback protocols used by repair prompts.
+        marker_parts: list[str] = []
+        for marker in ("CANDIDATE::", "<CANDIDATE>", "===CANDIDATE==="):
+            if marker in raw:
+                marker_parts = [part.strip() for part in raw.split(marker) if part.strip()]
+                if marker_parts:
+                    break
+        if marker_parts:
+            return cls._dedupe_texts(marker_parts, limit)
+
+        # Some models ignore the wrapper and emit paragraph-separated alternatives.
+        paragraphs = [part.strip() for part in raw.replace("\r\n", "\n").split("\n\n") if part.strip()]
+        if 1 < len(paragraphs) <= limit * 2:
+            return cls._dedupe_texts(paragraphs, limit)
+
+        # Last parser-level fallback: any non-empty successful Solar completion is
+        # still an externally judgeable proposal. Jev can score/prune it later.
+        return cls._dedupe_texts([raw], limit)
+
+    @staticmethod
+    def _route_fallback_blueprint(user_text: str, plan: dict[str, Any], stage: str) -> str:
+        """Build a minimal non-model fallback from the already available route."""
+        intent = str(plan.get("intent") or user_text[:240] or "Answer the user request").strip()
+        route = plan.get("route") or []
+        if not isinstance(route, list):
+            route = [str(route)]
+        route = [str(x).strip() for x in route if str(x).strip()][:6]
+        required = plan.get("required_points") or []
+        if not isinstance(required, list):
+            required = [str(required)]
+        required = [str(x).strip() for x in required if str(x).strip()][:6]
+        pieces = [f"Intent: {intent}"]
+        if route:
+            pieces.append("Route: " + " -> ".join(route))
+        if required:
+            pieces.append("Must cover: " + "; ".join(required))
+        pieces.append(f"Fallback stage: {stage}")
+        return " | ".join(pieces)
+
+    def _repair_blueprint_plain(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        stage: str,
+        avoid: list[str],
+        reasoning_effort: str,
+    ) -> str | None:
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-8:],
+            "route": plan,
+            "stage": stage,
+            "avoid_duplicates_of": avoid[-12:],
+        }
+        result = self.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return exactly ONE compact semantic answer blueprint as plain text. "
+                        "No JSON, no label, no preface, no chain-of-thought. "
+                        "It must be directly judgeable for correctness and constraint fit."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            reasoning_effort=reasoning_effort,
+            max_tokens=2048,
+        )
+        value = (result.text or "").strip()
+        return value or None
+
     def _repair_single_continuation(
         self,
         *,
@@ -321,7 +428,12 @@ class SolarClient:
         stage: str,
         reasoning_effort: str = "high",
     ) -> list[str]:
-        """Generate compact answer blueprints, not hidden chain-of-thought."""
+        """Generate compact answer blueprints without format-fragile failure.
+
+        Solar is allowed to drift away from JSON. A successful but oddly formatted
+        completion is recovered as a candidate; repeated empty completions degrade
+        to the already-computed route instead of aborting JevNet.
+        """
         count = max(1, min(32, count))
         payload = {
             "user_request": user_text,
@@ -341,30 +453,56 @@ class SolarClient:
             "You are the proposal population generator inside an inference-time decision network. "
             "Return strict JSON {\"candidates\":[\"...\"]}. Generate distinct compact answer blueprints, not final prose and not chain-of-thought."
         )
+
         result = self.chat(
             [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             reasoning_effort=reasoning_effort,
-            max_tokens=min(6400, 900 + count * 210),
+            max_tokens=min(10000, max(4096, 1400 + count * 360)),
         )
-        out = recover_candidate_strings(result.text, count)
-        # One supplementation pass if the model under-produces badly.
+        out = self._recover_blueprints_lenient(result.text, count)
+
+        # Second pass deliberately changes the output protocol. If JSON is what
+        # caused the failure, repeating the same JSON request is not a real repair.
         if len(out) < max(2, count // 2):
             missing = count - len(out)
-            supplement = self.chat(
+            repair_payload = {**payload, "candidate_count": missing, "avoid_duplicates_of": out}
+            repair = self.chat(
                 [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps({**payload, "candidate_count": missing, "avoid_duplicates_of": out}, ensure_ascii=False)},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Generate additional compact answer blueprints. Do NOT use JSON. "
+                            "Write each candidate after the exact marker CANDIDATE:: and nothing else."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=False)},
                 ],
                 reasoning_effort=reasoning_effort,
-                max_tokens=min(4800, 700 + missing * 210),
+                max_tokens=min(10000, max(4096, 1400 + max(1, missing) * 360)),
             )
-            for item in recover_candidate_strings(supplement.text, missing):
-                if item not in out:
-                    out.append(item)
-                if len(out) >= count:
-                    break
+            out = self._dedupe_texts(out + self._recover_blueprints_lenient(repair.text, missing), count)
+
+        # Plain-text single-candidate repairs remove all list/wrapper parsing from
+        # the equation. Cap retries so robustness does not become an infinite loop.
+        repair_attempts = min(3, max(0, count - len(out)))
+        for attempt in range(repair_attempts):
+            candidate = self._repair_blueprint_plain(
+                user_text=user_text,
+                history=history,
+                plan=plan,
+                stage=f"{stage}; plain repair {attempt + 1}",
+                avoid=out,
+                reasoning_effort=reasoning_effort,
+            )
+            if candidate:
+                out = self._dedupe_texts(out + [candidate], count)
+            if len(out) >= count:
+                break
+
         if not out:
-            raise SolarError("Solar hypothesis expansion returned no recoverable candidates")
+            # This is intentionally deterministic: parser/format failure must not
+            # crash the network after the route planner already succeeded.
+            out = [self._route_fallback_blueprint(user_text, plan, stage)]
         return out[:count]
 
     def mutate_reasoning_paths(
@@ -401,9 +539,12 @@ class SolarClient:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             reasoning_effort=reasoning_effort,
-            max_tokens=min(5200, 700 + count * 240),
+            max_tokens=min(10000, max(4096, 1300 + count * 360)),
         )
-        return recover_candidate_strings(result.text, count)
+        out = self._recover_blueprints_lenient(result.text, count)
+        if out:
+            return out
+        return parents[:1]
 
     def adaptive_reasoning_operation(
         self,
@@ -475,23 +616,33 @@ class SolarClient:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             reasoning_effort=reasoning_effort,
-            max_tokens=min(7200, 850 + count * 260),
+            max_tokens=min(10000, max(4096, 1500 + count * 420)),
         )
-        out = recover_candidate_strings(result.text, count)
+        out = self._recover_blueprints_lenient(result.text, count)
         if out:
             return out[:count]
 
-        # Do not abort the whole network because one action response drifted from JSON.
-        # Fall back to a tiny generic expansion, still respecting the requested count cap.
-        fallback = self.expand_reasoning_paths(
+        # Remove structured-output dependency completely for one repair attempt.
+        repaired = self._repair_blueprint_plain(
             user_text=user_text,
             history=history,
             plan=plan,
-            count=min(count, 3),
-            stage=f"fallback after adaptive action {action}",
+            stage=f"adaptive {action} round {round_index + 1}",
+            avoid=existing,
             reasoning_effort=reasoning_effort,
         )
-        return fallback[:count]
+        if repaired:
+            return [repaired]
+
+        # If Solar returns successful-but-empty content twice, do not kill a long
+        # Jev search. Reuse an already judged survivor so the controller can
+        # continue to VERIFY/STOP on the next round.
+        survivor = next((x.strip() for x in parents if x and x.strip()), None)
+        if survivor is None:
+            survivor = next((x.strip() for x in existing if x and x.strip()), None)
+        if survivor:
+            return [survivor]
+        return [self._route_fallback_blueprint(user_text, plan, f"adaptive {action}")]
 
     def render_answer_drafts(
         self,
@@ -533,7 +684,7 @@ class SolarClient:
                 reasoning_effort=reasoning_effort,
                 max_tokens=ceiling,
             ).text.strip()
-            return [text] if text else []
+            return [text] if text else [chosen_blueprint]
 
         result = self.chat(
             [
@@ -543,7 +694,7 @@ class SolarClient:
             reasoning_effort=reasoning_effort,
             max_tokens=min(8000, ceiling * count),
         )
-        drafts = recover_candidate_strings(result.text, count)
+        drafts = self._recover_blueprints_lenient(result.text, count)
         if drafts:
             return drafts[:count]
         fallback = self.chat(
@@ -554,7 +705,11 @@ class SolarClient:
             reasoning_effort=reasoning_effort,
             max_tokens=ceiling,
         ).text.strip()
-        return [fallback] if fallback else []
+        if fallback:
+            return [fallback]
+        # A successful-but-empty surface render should not erase a valid winning
+        # blueprint. It is less polished, but remains a usable final fallback.
+        return [chosen_blueprint]
 
     def direct_answer(self, *, user_text: str, history: list[dict[str, str]], reasoning_effort: str = "high", response_length: str = "medium") -> str:
         _target, ceiling, _desc = next(((target, max_tokens, desc) for name, target, max_tokens, desc in RESPONSE_LENGTHS if name == response_length), (550, 1400, "normal"))
