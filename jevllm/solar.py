@@ -828,6 +828,12 @@ class SolarClient:
                 "Preserve a materially different rival when the current leader is not actually verified.",
                 "Turn the result into rival/repaired candidate blueprints that include the decisive evidence, not merely stronger-sounding prose.",
             ],
+            "REVIVE": [
+                "Generate clean-room hypotheses from the original user request only.",
+                "Do not inherit the current leader, current rival, their terminology, their constructions, or their claimed invariants.",
+                "Re-derive the problem independently and seek solution families that the existing pool may have missed.",
+                "Use this after a discriminating test failed to resolve an entrenched disagreement.",
+            ],
         }
         instructions = operation_instructions.get(action, operation_instructions["REFILL"])
         payload = {
@@ -836,8 +842,8 @@ class SolarClient:
             "route": plan,
             "adaptive_round": round_index + 1,
             "action": action,
-            "parent_blueprints": parents,
-            "existing_pool": existing[:24],
+            "parent_blueprints": [] if action == "REVIVE" else parents,
+            "existing_pool": [] if action == "REVIVE" else existing[:24],
             "candidate_count": count,
             "requirements": [
                 *instructions,
@@ -848,7 +854,8 @@ class SolarClient:
         }
         system = (
             "You are Solar acting as the proposal generator for an adaptive Jev decision network. "
-            "Perform exactly the requested search operation. Return strict JSON {\"candidates\":[\"...\"]}."
+            "Perform exactly the requested search operation. For REVIVE, solve from the original request clean-room "
+            "and ignore prior hypotheses completely. Return strict JSON {\"candidates\":[\"...\"]}."
         )
         result = self.chat(
             [
