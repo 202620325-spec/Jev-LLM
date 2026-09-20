@@ -35,6 +35,7 @@ MODE_TO_REASONING = {
 
 BREADTH_LEVELS = [1, 2, 3, 4, 6]
 
+# How much context should be considered as one decision field.
 REASONING_SCOPES = [
     ("local", "only the immediate next fragment and local correctness"),
     ("sentence", "the current sentence or semantic move"),
@@ -44,7 +45,9 @@ REASONING_SCOPES = [
     ("multi_angle", "global answer with cross-checking across multiple plausible interpretations/angles"),
 ]
 
+# Final answer surface budget. These are target ceilings, not promises to fill every token.
 RESPONSE_LENGTHS = [
+    # name, desired surface tokens, API ceiling (includes reasoning headroom), description
     ("micro", 80, 512, "one or a few compact sentences"),
     ("short", 220, 768, "a concise answer with only the necessary support"),
     ("medium", 550, 1400, "a normal complete answer with useful explanation"),
