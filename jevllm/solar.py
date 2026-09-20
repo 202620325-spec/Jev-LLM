@@ -744,11 +744,30 @@ class SolarClient:
             winner = str(winner).strip() if winner is not None else None
             if winner not in valid_ids:
                 winner = None
-            resolved = bool(parsed.get("resolved")) and winner is not None
+            test_kind = str(parsed.get("test_kind", "INCONCLUSIVE")).upper()
+            winner_pass = any(
+                item["candidate_id"] == winner
+                and item["verdict"] == "PASS"
+                and item["confidence"] >= 0.60
+                for item in cleaned_results
+            )
+            separated_rival = any(
+                item["candidate_id"] != winner
+                and item["verdict"] == "FAIL"
+                and item["confidence"] >= 0.60
+                for item in cleaned_results
+            )
+            resolved = (
+                bool(parsed.get("resolved"))
+                and winner is not None
+                and winner_pass
+                and separated_rival
+                and test_kind not in {"INCONCLUSIVE", "EXTERNAL_REQUIRED"}
+            )
             return {
                 "material_disagreement": bool(parsed.get("material_disagreement", True)),
                 "test": str(parsed.get("test", "")).strip(),
-                "test_kind": str(parsed.get("test_kind", "INCONCLUSIVE")).upper(),
+                "test_kind": test_kind,
                 "resolved": resolved,
                 "winner_id": winner if resolved else None,
                 "results": cleaned_results,
