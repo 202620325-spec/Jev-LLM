@@ -1663,6 +1663,55 @@ class SolarClient:
         }
         return [repaired or chosen_blueprint]
 
+    def repair_state_locked_answer(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        state_lock: dict[str, Any],
+        answer: str,
+        audit: dict[str, Any],
+    ) -> str:
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-4:],
+            "state_lock": state_lock,
+            "answer_to_repair": answer,
+            "conformance_audit": {
+                "state_violation": audit.get("state_violation"),
+                "unsupported_expansion": audit.get("unsupported_expansion"),
+                "register_match": audit.get("register_match"),
+                "length_match": audit.get("length_match"),
+            },
+            "rules": [
+                "Return only the repaired user-facing answer.",
+                "Use ONLY required_claims, active_concepts, and optional_concepts from state_lock.",
+                "Delete every extra factual concept. Do not replace it with a different extra concept.",
+                "Never surface suppressed_concepts.",
+                "Match register and abstraction.",
+                "Respect max_sentences and max_chars.",
+                "Prefer the shortest sufficient wording.",
+            ],
+        }
+        result = self.chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Repair a state-locked answer. This is deletion/compression, not new reasoning. "
+                        "Do not add knowledge outside the supplied state."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            reasoning_effort="low",
+            max_tokens=700,
+        )
+        candidate = (result.text or "").strip()
+        if candidate and self._state_lock_problem(candidate, state_lock) is None:
+            return candidate
+        return answer
+
     def direct_answer(self, *, user_text: str, history: list[dict[str, str]], reasoning_effort: str = "high", response_length: str = "medium") -> str:
         """Solar-only baseline with empty-surface recovery.
 
