@@ -585,6 +585,64 @@ class JevClient:
             })
         return out
 
+    def audit_state_lock(
+        self,
+        *,
+        user_text: str,
+        state_lock: dict[str, Any],
+        answer: str,
+    ) -> dict[str, Any]:
+        """Check state conformance only; this is not another answer-selection vote."""
+        data = self.decide(
+            {
+                "description": (
+                    "Check whether one rendered answer stayed inside a closed semantic state. "
+                    "Do not reward extra helpful detail; extra factual concepts are violations."
+                ),
+                "records": [{"id": "A", "record": json.dumps({"answer": answer}, ensure_ascii=False)}],
+                "context": {
+                    "user_request": user_text,
+                    "state_lock": state_lock,
+                },
+            },
+            {
+                "state_violation": {
+                    "type": "noul",
+                    "instructions": "Did the answer introduce a factual concept outside required_claims/active_concepts/optional_concepts or surface a suppressed concept?",
+                    "true_when": "Any new factual semantic branch appears outside the locked state.",
+                    "false_when": "The answer only verbalizes the locked state.",
+                },
+                "unsupported_expansion": {
+                    "type": "noul",
+                    "instructions": "Did the answer expand a simple definition into extra duties, hierarchy, history, examples, organizations, certifications, or implications not licensed by the state?",
+                    "true_when": "There is semantic expansion beyond the locked meaning.",
+                    "false_when": "No unsupported expansion is present.",
+                },
+                "register_match": {
+                    "type": "score",
+                    "instructions": "How well does the answer match the state_lock register?",
+                    "criteria": [
+                        "Strong mismatch.", "Mismatch.", "Weak match.", "Acceptable match.", "Good match.", "Excellent match."
+                    ],
+                },
+                "length_match": {
+                    "type": "score",
+                    "instructions": "How well does the answer respect max_sentences/max_chars and minimal-sufficient length?",
+                    "criteria": [
+                        "Severely bloated.", "Too long.", "Somewhat long.", "Acceptable.", "Concise.", "Minimal and sufficient."
+                    ],
+                },
+            },
+        )
+        answers = data.get("answers") or {}
+        return {
+            "state_violation": noul_probability(answers.get("state_violation", {}), 0.5),
+            "unsupported_expansion": noul_probability(answers.get("unsupported_expansion", {}), 0.5),
+            "register_match": score_expectation(answers.get("register_match", {}), 6),
+            "length_match": score_expectation(answers.get("length_match", {}), 6),
+            "raw": data,
+        }
+
     def _choose(self, *, user_text: str, plan: dict[str, Any], candidates: list[str], label: str, instruction: str) -> tuple[int, dict[str, Any]]:
         if not candidates:
             raise ValueError("cannot choose from zero candidates")
