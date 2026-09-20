@@ -756,7 +756,7 @@ class SolarClient:
             len(required) >= 2
             or bool(re.search(
                 r"\b(prove|proof|minimal|minimality|construction|construct|derive|explain|justify|counterexample)\b",
-                user_text,
+                user_text + " " + answer_shape,
                 flags=re.I,
             ))
         )
