@@ -256,7 +256,11 @@ def main() -> int:
             return 1
 
     print(BANNER)
-    print(f"Jev={config.jev_model} | Solar={config.solar_model}\n")
+    print(f"Jev={config.jev_model} | Solar={config.solar_model}")
+    if config.conversation_log_enabled:
+        print(f"Log={engine.conversation_logger.path}\n")
+    else:
+        print("Log=disabled\n")
 
     while True:
         try:
@@ -358,7 +362,12 @@ def main() -> int:
                 engine.pipeline_mode = original_pipeline
             continue
         if cmd == ":reset":
-            engine.reset(); print("history cleared"); continue
+            engine.reset()
+            if engine.config.conversation_log_enabled:
+                print(f"history cleared; new_log={engine.conversation_logger.path}")
+            else:
+                print("history cleared")
+            continue
         if cmd == ":doctor":
             try:
                 ok, detail = engine.doctor(); print(("PASS" if ok else "FAIL") + " - " + detail)
