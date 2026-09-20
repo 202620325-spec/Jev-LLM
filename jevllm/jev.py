@@ -369,6 +369,7 @@ class JevClient:
             "MUTATE": "Repair or alter promising candidates to remove weak assumptions or constraint failures.",
             "MERGE": "Combine complementary strengths from multiple surviving candidates into new candidates.",
             "CHALLENGE": "Generate adversarial/counter-hypotheses that attack the strongest current route and expose hidden errors.",
+            "REVIVE": "Discard the current hypothesis framing and request clean-room alternatives from the original problem after an unresolved evidence test.",
             "VERIFY": "Run one evidence-producing discriminating test on materially conflicting hypotheses. Do not repeat semantic scoring of the same unchanged candidates.",
         }
         action_criteria = {a: action_descriptions[a] for a in allowed_actions if a in action_descriptions}
