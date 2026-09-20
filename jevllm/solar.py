@@ -1018,6 +1018,7 @@ class SolarClient:
         broken_output: str,
         reason: str,
         ceiling: int,
+        verification_evidence: list[dict[str, Any]] | None = None,
     ) -> str | None:
         payload = {
             "user_request": user_text,
@@ -1025,13 +1026,15 @@ class SolarClient:
             "route": plan,
             "winning_blueprint": chosen_blueprint,
             "supporting_survivors": supporting_blueprints,
+            "verification_evidence": verification_evidence or [],
             "broken_or_incomplete_output": broken_output[-5000:],
             "repair_reason": reason,
             "requirements": [
                 "Return ONE complete user-facing answer as plain text/Markdown, not JSON.",
                 "Answer every explicitly requested part.",
                 "Do not return only a heading, label, outline fragment, or sentence stub.",
-                "Preserve the winning blueprint semantics; repair surface completeness/formatting.",
+                "Preserve the winning blueprint semantics except where verification evidence explicitly overrides it.",
+                "Never resurrect a claim marked FAIL by verification evidence.",
                 "Do not mention this repair process or internal candidates.",
             ],
         }
@@ -1139,6 +1142,7 @@ class SolarClient:
                 broken_output=text,
                 reason=problem or "empty final surface",
                 ceiling=ceiling,
+                verification_evidence=verification_evidence,
             )
             self.last_render_stats = {
                 "mode": "single",
@@ -1204,6 +1208,7 @@ class SolarClient:
             broken_output=broken,
             reason=reason,
             ceiling=ceiling,
+            verification_evidence=verification_evidence,
         )
         self.last_render_stats = {
             "mode": "multi",
