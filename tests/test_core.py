@@ -638,6 +638,7 @@ class CoreTests(unittest.TestCase):
                 self.call_count = 0
                 self.verify_calls = 0
                 self.challenge_calls = 0
+                self.revive_calls = 0
                 self.last_render_stats = {}
             def expand_reasoning_paths(self, *, count, **kwargs):
                 self.call_count += 1
@@ -660,6 +661,8 @@ class CoreTests(unittest.TestCase):
                 self.call_count += 1
                 if action == "CHALLENGE":
                     self.challenge_calls += 1
+                if action == "REVIVE":
+                    self.revive_calls += 1
                 return [f"{action} evidence candidate {i}" for i in range(count)]
             def render_answer_drafts(self, *, count, **kwargs):
                 self.call_count += 1
@@ -677,10 +680,10 @@ class CoreTests(unittest.TestCase):
             generated_override=8,
         )
         self.assertGreaterEqual(solar.verify_calls, 1)
-        self.assertGreaterEqual(solar.challenge_calls, 1)
+        self.assertGreaterEqual(solar.revive_calls, 1)
         # Initial candidates are evaluated once; no all-pool semantic rescore after VERIFY.
-        self.assertEqual(jev.eval_calls, 2)  # initial pool + newly challenged candidates
-        self.assertEqual(net.last_stats["adaptive_actions"][:2], ["VERIFY", "CHALLENGE"])
+        self.assertEqual(jev.eval_calls, 2)  # initial pool + newly revived candidates
+        self.assertEqual(net.last_stats["adaptive_actions"][:2], ["VERIFY", "REVIVE"])
         self.assertGreater(net.last_stats["reused_evaluations"], 0)
 
     def test_evidence_falsification_can_remove_semantic_leader(self):
