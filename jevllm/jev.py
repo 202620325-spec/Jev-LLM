@@ -72,7 +72,9 @@ class JevClient:
         usage_raw = usage_raw if isinstance(usage_raw, dict) else {}
         input_tokens = int(usage_raw.get("prompt_tokens", usage_raw.get("input_tokens", 0)) or 0)
         output_tokens = int(usage_raw.get("completion_tokens", usage_raw.get("output_tokens", 0)) or 0)
-        usage_reported = bool(usage_raw)
+        usage_reported = any(
+            key in usage_raw for key in ("prompt_tokens", "input_tokens", "completion_tokens", "output_tokens")
+        )
         self.audit_calls.append(make_call_record(
             provider="jev",
             model=self.config.jev_model,
