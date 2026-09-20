@@ -1077,6 +1077,7 @@ class SolarClient:
         count: int,
         response_length: str,
         reasoning_effort: str,
+        verification_evidence: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         count = max(1, min(6, count))
         length_data = next(
@@ -1090,6 +1091,7 @@ class SolarClient:
             "route": plan,
             "winning_blueprint": chosen_blueprint,
             "supporting_survivors": supporting_blueprints,
+            "verification_evidence": verification_evidence or [],
             "draft_count": count,
             "response_length": {"name": response_length, "target_tokens": target, "description": desc},
             "requirements": [
@@ -1098,6 +1100,8 @@ class SolarClient:
                 "Use supporting survivors only when they improve correctness or completeness.",
                 "Do not mention the internal network, candidates, scores, or hidden reasoning unless asked.",
                 "Each draft must independently answer the whole request.",
+                "When verification evidence is present, it overrides unsupported or failed claims from the original blueprint.",
+                "Do not resurrect a claim marked FAIL by the evidence report.",
             ],
         }
 
