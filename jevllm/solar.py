@@ -1168,12 +1168,35 @@ class SolarClient:
         query_mode: str,
     ) -> dict[str, Any]:
         simple = query_mode == "simple_definition"
-        required = self._clean_state_list(raw.get("required_claims"), 4 if simple else 12)
-        if not required:
+        if simple:
+            # The state compiler is not allowed to strengthen or broaden the
+            # semantic claim selected by Jev.
             required = [chosen_blueprint.strip()]
+        else:
+            required = self._clean_state_list(raw.get("required_claims"), 12)
+            if not required:
+                required = [chosen_blueprint.strip()]
+
         active = self._clean_state_list(raw.get("active_concepts"), 6 if simple else 14)
         optional = self._clean_state_list(raw.get("optional_concepts"), 2 if simple else 6)
         suppressed = self._clean_state_list(raw.get("suppressed_concepts"), 10 if simple else 16)
+
+        if simple:
+            grounding_source = (user_text + " " + chosen_blueprint).casefold()
+            source_tokens = {
+                token.rstrip("s")
+                for token in re.findall(r"[0-9a-zA-Z가-힣_-]{2,}", grounding_source)
+            }
+
+            def grounded(concept: str) -> bool:
+                tokens = {
+                    token.rstrip("s")
+                    for token in re.findall(r"[0-9a-zA-Z가-힣_-]{2,}", concept.casefold())
+                }
+                return bool(tokens & source_tokens)
+
+            active = [concept for concept in active if grounded(concept)]
+            optional = [concept for concept in optional if grounded(concept)]
 
         try:
             max_sentences = int(raw.get("max_sentences", 2 if simple else 8))
