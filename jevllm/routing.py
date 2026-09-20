@@ -52,8 +52,7 @@ def classify_query_mode(user_text: str, plan: dict[str, Any] | None = None) -> s
         return "reasoning"
 
     simple_hit = any(re.search(pattern, lowered, flags=re.I) for pattern in _SIMPLE_DEFINITION_PATTERNS)
-    if simple_hit and len(text) <= 180 and text.count("?") <= 1 and "
-" not in text:
+    if simple_hit and len(text) <= 180 and text.count("?") <= 1 and "\n" not in text:
         return "simple_definition"
 
     return "normal"
