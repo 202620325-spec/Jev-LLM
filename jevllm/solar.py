@@ -122,11 +122,19 @@ class SolarClient:
         return result
 
     def plan(self, user_text: str, history: list[dict[str, str]]) -> dict[str, Any]:
+        """Build a compact route without silently degrading on reasoning-only output.
+
+        Solar reasoning models can spend the whole completion budget in the
+        provider-side reasoning field and leave content empty. A generic
+        "Answer directly" fallback erased exactly the constraints JevNet needed
+        in hard problems, so planning now gets one bounded repair attempt.
+        """
         recent = history[-8:]
         system = (
             "You are the route planner inside a hybrid Jev+Solar language model. "
-            "Design a compact answer path, not chain-of-thought. Return JSON only. "
-            "The route contains high-level answer operations, required constraints, and answer shape."
+            "Return ONLY a compact JSON route, not a solution and not chain-of-thought. "
+            "Name important verification obligations when the answer could hinge on "
+            "a construction, invariant, counterexample, calculation, or executable claim."
         )
         prompt = {
             "user_request": user_text,
@@ -135,28 +143,56 @@ class SolarClient:
                 "intent": "short string",
                 "route": ["3-6 short high-level operations"],
                 "required_points": ["facts/actions that must appear, may be empty"],
+                "verification_needs": [
+                    "claims that must be tested rather than merely scored, may be empty"
+                ],
                 "answer_shape": "short description",
                 "risk_or_uncertainty": ["only material uncertainties, may be empty"],
                 "language": "target response language",
             },
         }
-        result = self.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-            ],
-            reasoning_effort="medium",
-            max_tokens=700,
-        )
-        try:
-            parsed = extract_json(result.text)
-        except (ValueError, json.JSONDecodeError):
-            parsed = {}
-        if not isinstance(parsed, dict):
-            parsed = {}
+
+        parsed: dict[str, Any] = {}
+        attempts = [
+            ("low", 900, system),
+            (
+                "low",
+                1600,
+                system
+                + " The previous attempt did not yield usable JSON. Keep reasoning minimal "
+                  "and put the JSON in the visible content field.",
+            ),
+        ]
+        for effort, max_tokens, attempt_system in attempts:
+            result = self.chat(
+                [
+                    {"role": "system", "content": attempt_system},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                reasoning_effort=effort,
+                max_tokens=max_tokens,
+            )
+            if not (result.text or "").strip():
+                continue
+            try:
+                candidate = extract_json(result.text)
+            except (ValueError, json.JSONDecodeError):
+                candidate = {}
+            if isinstance(candidate, dict) and candidate:
+                parsed = candidate
+                break
+
         parsed.setdefault("intent", user_text[:160])
-        parsed.setdefault("route", ["Answer the request directly"])
+        parsed.setdefault(
+            "route",
+            [
+                "Identify materially different conclusions or solution families",
+                "Test answer-changing claims with explicit evidence",
+                "Answer only after unresolved contradictions are handled",
+            ],
+        )
         parsed.setdefault("required_points", [])
+        parsed.setdefault("verification_needs", [])
         parsed.setdefault("answer_shape", "direct answer")
         parsed.setdefault("risk_or_uncertainty", [])
         return parsed
@@ -600,6 +636,135 @@ class SolarClient:
             return out
         return parents[:1]
 
+    def discriminate_hypotheses(
+        self,
+        *,
+        user_text: str,
+        history: list[dict[str, str]],
+        plan: dict[str, Any],
+        candidates: list[dict[str, str]],
+        reasoning_effort: str = "high",
+    ) -> dict[str, Any]:
+        """Produce evidence that discriminates mutually incompatible hypotheses.
+
+        This is deliberately different from semantic scoring. The verifier must
+        identify an answer-changing claim and try to *test* it: replay a proposed
+        construction, substitute into equations, check a counterexample, derive an
+        invariant, enumerate a genuinely small finite case, or state that an
+        external deterministic tool is required. Unsupported plausibility is not
+        evidence.
+        """
+        compact = [
+            {"id": str(item.get("id", "")), "hypothesis": str(item.get("text", ""))}
+            for item in candidates[:8]
+            if str(item.get("id", "")).strip() and str(item.get("text", "")).strip()
+        ]
+        payload = {
+            "user_request": user_text,
+            "recent_conversation": history[-6:],
+            "route": plan,
+            "competing_hypotheses": compact,
+            "requirements": [
+                "Do not choose by style, confidence, familiarity, or majority vote.",
+                "Find the smallest decisive test that separates the incompatible claims.",
+                "Actually perform every check that can be performed from the prompt itself.",
+                "For a claimed construction, replay it against the stated rules.",
+                "For a claimed numeric/rank/parity/algebraic fact, derive or calculate it rather than trusting it.",
+                "If a real external tool/runtime is required and unavailable, mark EXTERNAL_REQUIRED instead of pretending it was verified.",
+                "PASS means the tested claim survived a concrete check; FAIL means a concrete contradiction/counterexample was found; UNCERTAIN means the check was not decisive.",
+            ],
+            "output_schema": {
+                "material_disagreement": "boolean",
+                "test": "short description of the decisive check actually attempted",
+                "test_kind": "DETERMINISTIC | DERIVATION | COUNTEREXAMPLE | EXTERNAL_REQUIRED | INCONCLUSIVE",
+                "resolved": "boolean; true only if evidence actually separates the hypotheses",
+                "winner_id": "candidate id only when resolved, otherwise null",
+                "results": [
+                    {
+                        "candidate_id": "candidate id",
+                        "verdict": "PASS | FAIL | UNCERTAIN",
+                        "confidence": "0..1",
+                        "evidence": "brief externally inspectable result, not hidden reasoning",
+                    }
+                ],
+            },
+        }
+        system = (
+            "You are the evidence verifier inside an inference-time search system. "
+            "The candidates may be confidently wrong. Run a discriminating check; "
+            "do not merely rate plausibility. Return strict JSON only."
+        )
+        attempts = [
+            (reasoning_effort, 3600),
+            ("medium", 2800),
+        ]
+        last_text = ""
+        for effort, max_tokens in attempts:
+            result = self.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                reasoning_effort=effort,
+                max_tokens=max_tokens,
+            )
+            last_text = (result.text or "").strip()
+            if not last_text:
+                continue
+            try:
+                parsed = extract_json(last_text)
+            except (ValueError, json.JSONDecodeError):
+                parsed = None
+            if not isinstance(parsed, dict):
+                continue
+
+            valid_ids = {item["id"] for item in compact}
+            cleaned_results: list[dict[str, Any]] = []
+            for item in parsed.get("results") or []:
+                if not isinstance(item, dict):
+                    continue
+                cid = str(item.get("candidate_id", "")).strip()
+                if cid not in valid_ids:
+                    continue
+                verdict = str(item.get("verdict", "UNCERTAIN")).upper()
+                if verdict not in {"PASS", "FAIL", "UNCERTAIN"}:
+                    verdict = "UNCERTAIN"
+                try:
+                    confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+                except (TypeError, ValueError):
+                    confidence = 0.5
+                cleaned_results.append({
+                    "candidate_id": cid,
+                    "verdict": verdict,
+                    "confidence": confidence,
+                    "evidence": str(item.get("evidence", "")).strip(),
+                })
+
+            winner = parsed.get("winner_id")
+            winner = str(winner).strip() if winner is not None else None
+            if winner not in valid_ids:
+                winner = None
+            resolved = bool(parsed.get("resolved")) and winner is not None
+            return {
+                "material_disagreement": bool(parsed.get("material_disagreement", True)),
+                "test": str(parsed.get("test", "")).strip(),
+                "test_kind": str(parsed.get("test_kind", "INCONCLUSIVE")).upper(),
+                "resolved": resolved,
+                "winner_id": winner if resolved else None,
+                "results": cleaned_results,
+                "raw": parsed,
+            }
+
+        return {
+            "material_disagreement": True,
+            "test": "Verifier did not return a usable evidence report.",
+            "test_kind": "INCONCLUSIVE",
+            "resolved": False,
+            "winner_id": None,
+            "results": [],
+            "raw_text": last_text,
+        }
+
     def adaptive_reasoning_operation(
         self,
         *,
@@ -639,8 +804,10 @@ class SolarClient:
                 "Do not concatenate blindly; reconcile conflicts and produce one integrated route per candidate.",
             ],
             "CHALLENGE": [
-                "Attack the strongest parent routes with plausible counterexamples, alternative interpretations, or failure modes.",
-                "Turn those challenges into rival/repaired candidate blueprints that could beat the current leader.",
+                "Treat the supplied parents as competing falsifiable hypotheses, not as a consensus to refine.",
+                "Attack the strongest answer-changing claim with a concrete counterexample, direct substitution, construction replay, invariant, or other checkable test.",
+                "Preserve a materially different rival when the current leader is not actually verified.",
+                "Turn the result into rival/repaired candidate blueprints that include the decisive evidence, not merely stronger-sounding prose.",
             ],
         }
         instructions = operation_instructions.get(action, operation_instructions["REFILL"])
