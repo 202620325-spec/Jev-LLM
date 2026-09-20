@@ -734,6 +734,7 @@ class JevDecisionNetwork:
                 count=requested,
                 round_index=round_index,
                 reasoning_effort=profile.reasoning_effort,
+                generation_mode=query_mode,
             )
             child_nodes = self._new_nodes(additions, generation=round_index + 1, source=action)
             generated_total += len(child_nodes)
