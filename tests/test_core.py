@@ -562,6 +562,215 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(solar.last_render_stats["protocol"], "structured")
         self.assertFalse(solar.last_render_stats["repaired"])
 
+    def test_plan_retries_reasoning_only_empty_content(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        solar = SolarClient(config)
+        calls = []
+        replies = iter([
+            SolarResult(
+                text="",
+                reasoning="spent budget reasoning",
+                raw={"choices": [{"finish_reason": "length"}]},
+            ),
+            SolarResult(
+                text='{"intent":"solve","route":["preserve alternatives","test claims","answer"],'
+                     '"required_points":["proof"],"verification_needs":["check construction"],'
+                     '"answer_shape":"short proof","risk_or_uncertainty":[]}',
+                raw={"choices": [{"finish_reason": "stop"}]},
+            ),
+        ])
+
+        def fake_chat(messages, *, reasoning_effort=None, max_tokens=None):
+            calls.append((reasoning_effort, max_tokens))
+            return next(replies)
+
+        solar.chat = fake_chat  # type: ignore[method-assign]
+        plan = solar.plan("hard question", [])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(plan["route"][1], "test claims")
+        self.assertEqual(plan["verification_needs"], ["check construction"])
+
+    def test_jevnet_does_not_rescore_unchanged_pool_after_verify(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        events = []
+
+        class FakeJev:
+            def __init__(self):
+                self.call_count = 0
+                self.eval_calls = 0
+                self.action_calls = 0
+            def evaluate_candidate_batch(self, *, candidates, **kwargs):
+                self.call_count += 1
+                self.eval_calls += 1
+                return [
+                    {"activation": 0.8 - i * 0.05, "survival": 0.8, "uncertainty": 0.3, "metrics": {}}
+                    for i, _ in enumerate(candidates)
+                ]
+            def assess_disagreement(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "material_disagreement": 0.9,
+                    "needs_test": 0.9,
+                    "leader_id": "N0",
+                    "rival_id": "N1",
+                    "raw": {},
+                }
+            def search_action(self, *, allowed_actions, **kwargs):
+                self.call_count += 1
+                self.action_calls += 1
+                # Try to VERIFY forever. Network must block the second identical VERIFY.
+                return {
+                    "action": "VERIFY",
+                    "refill_count": 2,
+                    "target_span": 2,
+                    "focus_id": "N0",
+                    "ready_to_stop": 0.2,
+                }
+            def choose_blueprint(self, *, candidates, **kwargs):
+                self.call_count += 1
+                return 0, {}
+            def choose_final_answer(self, *, drafts, **kwargs):
+                self.call_count += 1
+                return 0, {}
+
+        class FakeSolar:
+            def __init__(self):
+                self.call_count = 0
+                self.verify_calls = 0
+                self.challenge_calls = 0
+                self.last_render_stats = {}
+            def expand_reasoning_paths(self, *, count, **kwargs):
+                self.call_count += 1
+                return ["claim A", "claim not-A", *[f"seed {i}" for i in range(max(0, count - 2))]]
+            def discriminate_hypotheses(self, **kwargs):
+                self.call_count += 1
+                self.verify_calls += 1
+                return {
+                    "material_disagreement": True,
+                    "test": "inconclusive check",
+                    "test_kind": "INCONCLUSIVE",
+                    "resolved": False,
+                    "winner_id": None,
+                    "results": [
+                        {"candidate_id": "N0", "verdict": "UNCERTAIN", "confidence": 0.5, "evidence": ""},
+                        {"candidate_id": "N1", "verdict": "UNCERTAIN", "confidence": 0.5, "evidence": ""},
+                    ],
+                }
+            def adaptive_reasoning_operation(self, *, action, count, **kwargs):
+                self.call_count += 1
+                if action == "CHALLENGE":
+                    self.challenge_calls += 1
+                return [f"{action} evidence candidate {i}" for i in range(count)]
+            def render_answer_drafts(self, *, count, **kwargs):
+                self.call_count += 1
+                return ["final"] * count
+
+        jev = FakeJev()
+        solar = FakeSolar()
+        net = JevDecisionNetwork(config, jev, solar, lambda e, d: events.append((e, d)))
+        net.run(
+            user_text="q",
+            history=[],
+            plan={},
+            intensity="fast",
+            layers_override=3,
+            generated_override=8,
+        )
+        self.assertEqual(solar.verify_calls, 1)
+        self.assertGreaterEqual(solar.challenge_calls, 1)
+        # Initial candidates are evaluated once; no all-pool semantic rescore after VERIFY.
+        self.assertEqual(jev.eval_calls, 2)  # initial pool + newly challenged candidates
+        self.assertNotEqual(net.last_stats["adaptive_actions"][:2], ["VERIFY", "VERIFY"])
+        self.assertGreater(net.last_stats["reused_evaluations"], 0)
+
+    def test_evidence_falsification_can_remove_semantic_leader(self):
+        config = Config(openrouter_api_key="x", upstage_api_key="y")
+        chosen = []
+
+        class FakeJev:
+            def __init__(self): self.call_count = 0; self.actions = iter(["VERIFY", "STOP"])
+            def evaluate_candidate_batch(self, *, candidates, **kwargs):
+                self.call_count += 1
+                # False hypothesis is semantic leader before evidence.
+                return [
+                    {"activation": 0.95 if "false" in c else 0.65, "survival": 0.9, "uncertainty": 0.2, "metrics": {}}
+                    for c in candidates
+                ]
+            def assess_disagreement(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "material_disagreement": 0.95,
+                    "needs_test": 0.95,
+                    "leader_id": "N0",
+                    "rival_id": "N1",
+                    "raw": {},
+                }
+            def search_action(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "action": next(self.actions),
+                    "refill_count": 2,
+                    "target_span": 2,
+                    "focus_id": "POOL",
+                    "ready_to_stop": 0.2,
+                }
+            def choose_blueprint(self, *, candidates, **kwargs):
+                self.call_count += 1
+                chosen[:] = candidates
+                return 0, {}
+            def choose_final_answer(self, *, drafts, **kwargs):
+                self.call_count += 1
+                return 0, {}
+
+        class FakeSolar:
+            def __init__(self): self.call_count = 0; self.last_render_stats = {}
+            def expand_reasoning_paths(self, *, count, **kwargs):
+                self.call_count += 1
+                return ["false but polished conclusion", "correct rival conclusion"] + [
+                    f"neutral {i}" for i in range(max(0, count - 2))
+                ]
+            def discriminate_hypotheses(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "material_disagreement": True,
+                    "test": "replay the claimed construction",
+                    "test_kind": "DETERMINISTIC",
+                    "resolved": True,
+                    "winner_id": "N1",
+                    "results": [
+                        {
+                            "candidate_id": "N0",
+                            "verdict": "FAIL",
+                            "confidence": 0.99,
+                            "evidence": "construction does not produce the claimed state",
+                        },
+                        {
+                            "candidate_id": "N1",
+                            "verdict": "PASS",
+                            "confidence": 0.95,
+                            "evidence": "invariant holds under every allowed move",
+                        },
+                    ],
+                }
+            def adaptive_reasoning_operation(self, **kwargs):
+                raise AssertionError("No expansion needed after decisive evidence")
+            def render_answer_drafts(self, *, chosen_blueprint, count, **kwargs):
+                self.call_count += 1
+                return [chosen_blueprint] * count
+
+        net = JevDecisionNetwork(config, FakeJev(), FakeSolar())
+        answer = net.run(
+            user_text="q",
+            history=[],
+            plan={},
+            intensity="fast",
+            layers_override=2,
+        )
+        self.assertIn("correct rival", answer)
+        self.assertTrue(chosen)
+        self.assertNotIn("false but polished", chosen)
+        self.assertEqual(net.last_stats["evidence_tests"], 1)
+
     def test_direct_answer_recovers_after_empty_surface_completion(self):
         config = Config(openrouter_api_key="x", upstage_api_key="y")
         solar = SolarClient(config)
