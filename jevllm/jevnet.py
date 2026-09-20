@@ -737,15 +737,17 @@ class JevDecisionNetwork:
             "raw": plan_raw,
         })
 
+        render_count = 1 if evidence_winners else profile.final_drafts
         drafts = self.solar.render_answer_drafts(
             user_text=user_text,
             history=history,
             plan=plan,
             chosen_blueprint=chosen_blueprint,
             supporting_blueprints=[n.text for n in finalists[:5]],
-            count=profile.final_drafts,
+            count=render_count,
             response_length=profile.response_length,
             reasoning_effort=profile.reasoning_effort,
+            verification_evidence=evidence_reports[-3:],
         )
         if not drafts:
             raise RuntimeError("Solar produced zero final answer drafts")
