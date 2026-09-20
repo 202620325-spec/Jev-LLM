@@ -5,30 +5,30 @@ CMD chat MVP combining:
 - **Solar Pro 3**: generates semantic answer/solution candidates.
 - **Jev Decisions**: evaluates the live candidate pool and decides what inference operation happens next.
 
-The identity of v1.3 is **adaptive search**, not a fixed 8/16/24/30-candidate pipeline.
+The core identity is **adaptive search with evidence-gated collapse and locked surface generation**, not a fixed candidate-count pipeline.
 
 ## Core loop
 
 ```text
 question
-  -> Solar route
-  -> small seed candidate pool
-  -> Jev multi-axis evaluation
+  -> query router
+       simple definition -> small grounded search
+       reasoning/proof   -> evidence/claim validation enabled
+       normal            -> adaptive search
+  -> Solar semantic proposals
+  -> Jev evaluates NEW hypotheses
+  -> preserve material disagreement
   -> Jev chooses NEXT ACTION
-       STOP
-       REFILL
-       DIVERSE_REFILL
-       DEEPEN
-       MUTATE
-       MERGE
-       CHALLENGE
-       VERIFY
-  -> perform only that operation
-  -> evaluate again
-  -> repeat until Jev chooses STOP or an external compute cap is reached
-  -> Jev chooses winning blueprint
-  -> Solar renders competing final drafts
-  -> Jev chooses final answer
+       STOP / REFILL / DIVERSE_REFILL / DEEPEN / MUTATE
+       MERGE / CHALLENGE / REVIVE / VERIFY
+  -> VERIFY acquires discriminating evidence, not confidence-only rescoring
+  -> collapse only when justified
+  -> Jev chooses semantic blueprint
+  -> proof-like answers: atomic claim audit + repair/re-audit
+  -> simple definitions: STATE LOCK
+  -> Solar verbalizes the locked/verified state
+  -> optional state-conformance or surface claim audit
+  -> output
 ```
 
 ### Important
@@ -37,7 +37,7 @@ question
 
 Example: `:max` allows a much larger search, but if Jev chooses `STOP` after the first evaluation, only the seed population is used.
 
-The external controller can only stop Jev from exceeding configured latency/cost limits. Within that envelope Jev chooses whether to expand, diversify, deepen, mutate, merge, challenge, verify, or stop.
+The external controller limits latency/cost. Within that envelope Jev chooses whether to expand, diversify, deepen, mutate, merge, challenge, revive, verify, or stop. Simple-definition routing may intentionally choose a much smaller deterministic envelope before the adaptive loop.
 
 ## Adaptive actions
 
@@ -50,7 +50,8 @@ The external controller can only stop Jev from exceeding configured latency/cost
 | `MUTATE` | Repair weak assumptions or constraint failures. |
 | `MERGE` | Combine complementary survivors into new candidates. |
 | `CHALLENGE` | Generate adversarial/counter-hypotheses to attack the leader. |
-| `VERIFY` | No new Solar candidates; Jev re-checks strong candidates under stricter verification criteria. |
+| `REVIVE` | Hide the current pool and generate clean-room hypotheses from the original request. |
+| `VERIFY` | Acquire one discriminating evidence report; never same-pool confidence-only rescoring. |
 
 Jev also chooses:
 
